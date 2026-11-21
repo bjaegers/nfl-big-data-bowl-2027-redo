@@ -7,13 +7,13 @@ venv/
 env/
 .env
 
-# Large Data & DuckDB Database (exceeds GitHub 100MB limit)
+# Large Data & Full DuckDB Database (exceeds GitHub 100MB limit)
 data/
-*.duckdb
+nfl_data.duckdb
 *.duckdb.wal
+!nfl_data_lite.duckdb
 
 # OS / Editor
 .DS_Store
 Thumbs.db
 ~$*.docx
-

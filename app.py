@@ -15,7 +15,10 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nfl_data.duckdb")
+_ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+_FULL_DB = os.path.join(_ROOT_DIR, "nfl_data.duckdb")
+_LITE_DB = os.path.join(_ROOT_DIR, "nfl_data_lite.duckdb")
+DB_PATH = _FULL_DB if os.path.exists(_FULL_DB) else _LITE_DB
 
 @st.cache_resource
 def get_db_connection():
