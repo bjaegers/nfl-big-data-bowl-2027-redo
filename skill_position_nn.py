@@ -1,15 +1,29 @@
 """
-Skill Position Combine & Movement Neural Network Projector
-==========================================================
-Dual-branch multi-task neural network (pure NumPy implementation with Adam,
-Cosine Annealing, Huber/Smooth-L1 loss, Dropout, and Residual skip connections)
-that projects:
-  1. Rookie Year & Per-Game Yards (yards_per_game)
-  2. Rookie Year & Per-Game Touchdowns (tds_per_game)
-  3. 4th-Quarter / Clutch Scoring Rate (q4_tds_per_game)
-  4. 4th-Quarter Clutch Yards & Explosive Rate (clutch_yards_per_game)
-  5. 4th-Quarter Efficiency Step-Up (q4_vs_q13_ypr_diff) & Clutch WPA
-  6. Game-by-Game Yards & Touchdowns conditioned on game opportunity & late-game state
+Skill Position Combine & Movement Modeling Engine
+=================================================
+Multi-Model Suite & Team-Impact Projector:
+  Model Families:
+    1. Dual-Branch Multi-Task Neural Network (with Ridge residual skip & Smooth-L1 loss)
+    2. Bayesian Hierarchical Model (Position partial pooling, exposure precision weighting,
+       ARD shrinkage, analytical 10th-90th percentile Floor/Ceiling credible intervals,
+       and week-by-week Bayesian prior-to-posterior updating)
+    3. XGBoost-style Gradient Boosted Decision Trees (with native missing-value split routing)
+    4. Hybrid Stack Ensemble (combining NN + Bayesian Hierarchical + XGBoost/GBDT)
+
+  Target Suites (11 Targets):
+    A. Box-Score & Late-Game Clutch Suite (6 targets):
+       - Rookie Yards / Game (`yards_per_game`)
+       - Rookie TDs / Game (`tds_per_game`)
+       - Q4 Clutch Yards / Season (`clutch_yards_per_game`)
+       - 4th-Quarter TDs / Season (`q4_tds_per_game`)
+       - Q4 Explosive Plays (15+ yd) / Season (`q4_explosive_per_game`)
+       - Q4 Clutch Win Prob Added / Season (`clutch_wpa_per_season`)
+    B. Beyond-Box-Score Team Impact & Offensive Gravity Suite (5 targets):
+       - Chain-Moving 1st Downs / 100 Routes (`first_downs_per_100_routes`)
+       - 3rd & 4th Down Money Conversions / Season (`third_fourth_conv_per_season`)
+       - Expected Points Added on Targets / Season (`target_epa_per_season`)
+       - Target-Earning Rate (`tprr_pct` = Targets / 100 Routes)
+       - Offensive Gravity: Non-Target Team EPA / 100 Snaps (`gravity_non_target_epa_100`)
 """
 
 import os
@@ -78,14 +92,14 @@ def _is_player_td(row):
 
 
 # ---------------------------------------------------------------------------
-# Feature Extraction Pipeline from DuckDB
+# Feature Extraction & Team-Impact Pipeline from DuckDB
 # ---------------------------------------------------------------------------
 def build_skill_position_dataset(con=None):
     """
     Extracts and engineers:
       - Combine physical measurements & athletic indices from `combine_results`
       - Frame-by-frame Combine drill movement kinematics & phase profiles from `combine_tracking`
-      - Rookie-year (season == draft_year) and career per-game, per-route, and Q4/Clutch targets
+      - Box-score, 4th-Quarter Clutch, and Beyond-Box-Score Team Impact & Gravity targets
       - Individual player-game logs (`player_games_df`) across all rookie and career games
     """
     close_con = False
@@ -141,7 +155,6 @@ def build_skill_position_dataset(con=None):
         (tracking_df["delta_dir"] > 20.0) & (tracking_df["s"] > 2.0), tracking_df["s"], np.nan
     )
 
-    # Temporal phase progression within each active drill (0-25%, 25-50%, 50-75%, 75-100%)
     active_tr = tracking_df[tracking_df["s"] > 1.5].copy()
     active_tr["frame_idx"] = active_tr.groupby(["nfl_id", "drill_name", "attempt"]).cumcount()
     active_tr["frame_cnt"] = active_tr.groupby(["nfl_id", "drill_name", "attempt"])["s"].transform("count")
@@ -158,7 +171,6 @@ def build_skill_position_dataset(con=None):
         tr40_max_tang_a=("tangential_a", lambda x: np.percentile(x.dropna(), 95) if len(x.dropna()) > 0 else np.nan),
     ).reset_index()
 
-    # 40-Yd Dash Temporal Phase Encodings (Early Burst 0-25%, Drive 25-50%, Top-End 50-75%, Finish 75-100%)
     forty_act = active_tr[active_tr["drill_type"] == "FORTY_YARD_DASH"]
     if len(forty_act) > 0:
         p1 = forty_act[forty_act["rel_pos"] < 0.25].groupby("nfl_id")["a"].max().rename("tr40_phase1_burst_a")
@@ -216,7 +228,6 @@ def build_skill_position_dataset(con=None):
         )
         route_feats = route_feats.merge(sub, on="nfl_id", how="left")
 
-    # Late-drill speed retention in Gauntlet & Route drills
     route_act = active_tr[active_tr["drill_type"].isin(["SKILL_DRILLS_WR", "SKILL_DRILLS_TE"])]
     if len(route_act) > 0:
         late_r = route_act[route_act["rel_pos"] >= 0.75].groupby(["nfl_id", "drill_name", "attempt"])["s"].mean().reset_index().rename(columns={"s": "late_s"})
@@ -234,7 +245,7 @@ def build_skill_position_dataset(con=None):
     )
     df["route_to_40_speed_ratio"] = df["trroute_max_s"] / df["tr40_max_s"]
 
-    # 3. Play-by-Play Targets: Rookie Season, All Seasons, and Late-Game / Q4 Clutch
+    # 3. Play-by-Play Targets: Box Score, Q4 Clutch, and Beyond-Box-Score Team Impact & Gravity
     plays = con.execute("""
         SELECT 
             pp.game_id,
@@ -266,6 +277,7 @@ def build_skill_position_dataset(con=None):
             pp.route_ran,
             pp.separation_at_pass_forward,
             pp.cushion,
+            pp.in_motion_at_ball_snap,
             pp.play_nullified_by_penalty,
             pp.fumble_lost,
             pp.play_description
@@ -284,10 +296,35 @@ def build_skill_position_dataset(con=None):
     plays["rush_yards_clean"] = plays["rush_yards"].fillna(0.0)
     plays["scrimmage_yards"] = plays["rec_yards_clean"] + plays["rush_yards_clean"]
     plays["yac_clean"] = plays["yards_after_catch"].fillna(0.0)
+    plays["yacoe_play"] = np.where(
+        plays["rec_yards"].notna() & plays["expected_yards_after_catch"].notna(),
+        plays["yards_after_catch"].fillna(0.0) - plays["expected_yards_after_catch"].fillna(0.0),
+        0.0,
+    )
     plays["is_route"] = plays["route_ran"].notna().astype(int)
     plays["is_target"] = plays["target"].fillna(False).astype(int)
     plays["is_catch"] = plays["rec_yards"].notna().astype(int)
     plays["is_explosive"] = (plays["scrimmage_yards"] >= 15).astype(int)
+    plays["is_motion"] = plays["in_motion_at_ball_snap"].fillna(False).astype(int)
+
+    # Chain-moving first downs & 3rd/4th down conversions earned by the player
+    plays["is_first_down_earned"] = (
+        (plays["scrimmage_yards"] > 0)
+        & (plays["scrimmage_yards"] >= plays["yards_to_go"].fillna(99))
+    ).astype(int)
+    plays["is_money_down_conv"] = (
+        plays["down"].isin([3, 4]) & (plays["is_first_down_earned"] == 1)
+    ).astype(int)
+
+    # EPA dimensions: Positive Target EPA Created vs. Non-Targeted Decoy Team EPA ("Offensive Gravity")
+    plays["epa_clean"] = plays["expected_points_added"].fillna(0.0)
+    plays["target_epa_play"] = np.where(
+        (plays["is_target"] == 1) & (plays["epa_clean"] > 0), plays["epa_clean"], 0.0
+    )
+    plays["is_non_target_snap"] = (plays["is_target"] == 0).astype(int)
+    plays["non_target_epa_play"] = np.where(
+        (plays["is_target"] == 0) & (plays["epa_clean"] > 0), plays["epa_clean"], 0.0
+    )
 
     is_home = plays["team_abbr"] == plays["home_team_abbr"]
     plays["opponent_abbr"] = np.where(is_home, plays["visitor_team_abbr"], plays["home_team_abbr"])
@@ -313,7 +350,6 @@ def build_skill_position_dataset(con=None):
     ).astype(int)
     plays["is_rookie_play"] = (plays["season"] == plays["draft_year"]).astype(int)
 
-    # Game-level table (All seasons + flag for rookie season)
     plays["q4_yards_play"] = np.where(plays["is_q4"] == 1, plays["scrimmage_yards"], 0.0)
     plays["q4_td_play"] = np.where(plays["is_q4"] == 1, plays["is_td"], 0)
     plays["q4_route_play"] = np.where(plays["is_q4"] == 1, plays["is_route"], 0)
@@ -349,6 +385,13 @@ def build_skill_position_dataset(con=None):
             total_yards=("scrimmage_yards", "sum"),
             tds=("is_td", "sum"),
             yac=("yac_clean", "sum"),
+            yacoe=("yacoe_play", "sum"),
+            first_downs=("is_first_down_earned", "sum"),
+            money_down_conv=("is_money_down_conv", "sum"),
+            target_epa=("target_epa_play", "sum"),
+            non_target_snaps=("is_non_target_snap", "sum"),
+            non_target_epa=("non_target_epa_play", "sum"),
+            motion_snaps=("is_motion", "sum"),
             q4_routes=("q4_route_play", "sum"),
             q4_yards=("q4_yards_play", "sum"),
             q4_tds=("q4_td_play", "sum"),
@@ -359,7 +402,7 @@ def build_skill_position_dataset(con=None):
             clutch_wpa=("clutch_wpa_play", "sum"),
             avg_sep=("separation_at_pass_forward", "mean"),
             avg_cushion=("cushion", "mean"),
-            epa=("expected_points_added", "sum"),
+            epa=("epa_clean", "sum"),
         )
         .reset_index()
     )
@@ -392,11 +435,16 @@ def build_skill_position_dataset(con=None):
         .reset_index()
     )
 
-    # All-Seasons Career Late-Game & Clutch Aggregation (larger sample size for Q4 / Clutch stability)
+    # All-Seasons Career Late-Game & Team-Impact Aggregation
     career_summary = (
         player_games_df.groupby("nfl_id")
         .agg(
             career_games=("game_id", "nunique"),
+            career_snaps=("snaps", "sum"),
+            career_total_routes=("routes", "sum"),
+            career_total_targets=("targets", "sum"),
+            career_total_catches=("catches", "sum"),
+            career_total_yards=("total_yards", "sum"),
             career_yards_per_game=("total_yards", "mean"),
             career_tds_per_game=("tds", "mean"),
             career_q4_yards=("q4_yards", "sum"),
@@ -407,13 +455,18 @@ def build_skill_position_dataset(con=None):
             career_clutch_tds=("clutch_tds", "sum"),
             career_clutch_routes=("clutch_routes", "sum"),
             career_clutch_wpa=("clutch_wpa", "sum"),
-            career_total_routes=("routes", "sum"),
-            career_total_yards=("total_yards", "sum"),
+            career_first_downs=("first_downs", "sum"),
+            career_money_down_conv=("money_down_conv", "sum"),
+            career_target_epa=("target_epa", "sum"),
+            career_non_target_snaps=("non_target_snaps", "sum"),
+            career_non_target_epa=("non_target_epa", "sum"),
+            career_yacoe=("yacoe", "sum"),
+            career_motion_snaps=("motion_snaps", "sum"),
+            career_on_field_epa=("epa", "sum"),
         )
         .reset_index()
     )
 
-    # Compute Q4 vs Q1-Q3 Yards/Route Step-Up delta
     q13_routes = career_summary["career_total_routes"] - career_summary["career_q4_routes"]
     q13_yards = career_summary["career_total_yards"] - career_summary["career_q4_yards"]
     career_summary["q13_ypr"] = np.where(q13_routes >= 15, q13_yards / q13_routes, np.nan)
@@ -423,12 +476,39 @@ def build_skill_position_dataset(con=None):
         np.nan,
     )
     career_summary["q4_vs_q13_ypr_diff"] = career_summary["q4_ypr"] - career_summary["q13_ypr"]
-    # Normalize late-game totals per 17-game season played (so healthy durability + clutch rate are both reflected)
+
     seasons_equiv = np.maximum(1.0, career_summary["career_games"] / 15.0)
     career_summary["clutch_yards_per_game"] = career_summary["career_clutch_yards"] / seasons_equiv
     career_summary["q4_tds_per_game"] = career_summary["career_q4_tds"] / seasons_equiv
     career_summary["q4_explosive_per_game"] = career_summary["career_q4_explosive"] / seasons_equiv
     career_summary["clutch_wpa_per_season"] = career_summary["career_clutch_wpa"] / seasons_equiv
+
+    # Beyond-Box-Score Team Impact & Offensive Gravity Targets
+    # 1. Chain-Moving Rate: 1st Downs earned per 100 routes (shrunk slightly toward position mean for tiny sample players)
+    rt_denom = np.maximum(25.0, career_summary["career_total_routes"])
+    career_summary["first_downs_per_100_routes"] = (career_summary["career_first_downs"] / rt_denom) * 100.0
+    # 2. Money-Down Conversions (3rd & 4th down conversions per season)
+    career_summary["third_fourth_conv_per_season"] = career_summary["career_money_down_conv"] / seasons_equiv
+    # 3. Positive Expected Points Added on Targets per season (EPA+ Created)
+    career_summary["target_epa_per_season"] = career_summary["career_target_epa"] / seasons_equiv
+    # 4. Target-Earning Power: Targets per 100 Routes Run (TPRR %)
+    career_summary["tprr_pct"] = (career_summary["career_total_targets"] / rt_denom) * 100.0
+    # 5. Offensive Gravity: Empirical-Bayes shrunk Positive Decoy Team EPA per 100 Non-Targeted Snaps
+    career_summary["gravity_non_target_epa_100"] = (
+        career_summary["career_non_target_epa"] / (career_summary["career_non_target_snaps"] + 120.0)
+    ) * 100.0
+    # Additional diagnostic impact metrics
+    career_summary["yacoe_per_catch"] = np.where(
+        career_summary["career_total_catches"] >= 5,
+        career_summary["career_yacoe"] / career_summary["career_total_catches"],
+        0.0,
+    )
+    career_summary["motion_rate_pct"] = (
+        career_summary["career_motion_snaps"] / np.maximum(20.0, career_summary["career_snaps"])
+    ) * 100.0
+    career_summary["on_field_epa_per_100_snaps"] = (
+        career_summary["career_on_field_epa"] / np.maximum(30.0, career_summary["career_snaps"])
+    ) * 100.0
 
     df = df.merge(rk_summary, on="nfl_id", how="left").merge(career_summary, on="nfl_id", how="left")
 
@@ -451,6 +531,11 @@ def build_skill_position_dataset(con=None):
         "rk_clutch_tds",
         "rk_clutch_wpa",
         "career_games",
+        "career_snaps",
+        "career_total_routes",
+        "career_total_targets",
+        "career_total_catches",
+        "career_total_yards",
         "career_yards_per_game",
         "career_tds_per_game",
         "career_q4_yards",
@@ -465,10 +550,19 @@ def build_skill_position_dataset(con=None):
         "q4_tds_per_game",
         "q4_explosive_per_game",
         "clutch_wpa_per_season",
+        "first_downs_per_100_routes",
+        "third_fourth_conv_per_season",
+        "target_epa_per_season",
+        "tprr_pct",
+        "gravity_non_target_epa_100",
+        "yacoe_per_catch",
+        "motion_rate_pct",
+        "on_field_epa_per_100_snaps",
     ]
     for col in zero_fill_cols:
         df[col] = df[col].fillna(0.0)
 
+    df = df.copy()
     df["yards_per_route"] = np.where(
         df["total_routes"] >= 20, df["total_yards"] / df["total_routes"], np.nan
     )
@@ -478,7 +572,7 @@ def build_skill_position_dataset(con=None):
 
 
 # ---------------------------------------------------------------------------
-# Feature Tiers for the Neural Network
+# Feature Tiers & Target Definitions
 # ---------------------------------------------------------------------------
 PHYSICAL_FEATURES = [
     "is_wr",
@@ -561,7 +655,7 @@ FEATURE_TIERS = {
     "Tier 3: Combine + Movement + NGS + Draft Capital": PHYSICAL_FEATURES + MOVEMENT_FEATURES + NGS_PRE_DRAFT_FEATURES + DRAFT_CAPITAL_FEATURES,
 }
 
-TARGET_COLUMNS = [
+BOX_CLUTCH_TARGETS = [
     "yards_per_game",
     "tds_per_game",
     "clutch_yards_per_game",
@@ -570,6 +664,20 @@ TARGET_COLUMNS = [
     "clutch_wpa_per_season",
 ]
 
+TEAM_IMPACT_TARGETS = [
+    "first_downs_per_100_routes",
+    "third_fourth_conv_per_season",
+    "target_epa_per_season",
+    "tprr_pct",
+    "gravity_non_target_epa_100",
+]
+
+TARGET_COLUMNS = BOX_CLUTCH_TARGETS + TEAM_IMPACT_TARGETS
+
+# Targets that can take negative values (EPA metrics)
+SIGNED_TARGETS = {"target_epa_per_season", "gravity_non_target_epa_100"}
+NON_NEGATIVE_MASK = np.array([c not in SIGNED_TARGETS for c in TARGET_COLUMNS], dtype=bool)
+
 TARGET_LABELS = {
     "yards_per_game": "Rookie Yards / Game",
     "tds_per_game": "Rookie TDs / Game",
@@ -577,23 +685,38 @@ TARGET_LABELS = {
     "q4_tds_per_game": "4th-Quarter TDs / Season",
     "q4_explosive_per_game": "Q4 Explosive Plays (15+ yd) / Season",
     "clutch_wpa_per_season": "Q4 Clutch Win Prob Added (WPA / Season)",
+    "first_downs_per_100_routes": "Chain-Moving: 1st Downs / 100 Routes",
+    "third_fourth_conv_per_season": "Money Downs: 3rd/4th Conv / Season",
+    "target_epa_per_season": "Value Creation: Target EPA / Season",
+    "tprr_pct": "Target-Earning Power: TPRR (%)",
+    "gravity_non_target_epa_100": "Offensive Gravity: Decoy Team EPA / 100 Snaps",
 }
 
+MODEL_FAMILIES = [
+    "Hybrid Stack Ensemble (NN + Bayesian + XGBoost)",
+    "Dual-Branch Multi-Task Neural Network",
+    "Bayesian Hierarchical Model (Partial Pooling + Credible Intervals)",
+    "XGBoost / Gradient Boosted Trees (Native Missingness)",
+]
+
 
 # ---------------------------------------------------------------------------
-# Dual-Branch Multi-Task Neural Network (Pure NumPy with Adam + Residual Skip)
+# MODEL FAMILY 1: Dual-Branch Multi-Task Neural Network
 # ---------------------------------------------------------------------------
 class DualBranchCombineNN:
-    """
-    Dual-Branch Multi-Task Neural Network with Residual Skip Connection:
-      - Branch A (Physical & Pre-Draft Encoder): Dense(d_phys -> h_phys) + LayerNorm + SiLU/GELU
-      - Branch B (Combine Movement Kinematics Encoder): Dense(d_move -> h_move) + LayerNorm + SiLU/GELU
-      - Fusion Layer: Concat([Branch A, Branch B]) -> Dense(h_phys + h_move -> h_joint) + SiLU + Dropout
-      - Multi-Task Output Head + Residual Linear Skip: Predicts 6 targets simultaneously
-        using Smooth-L1 (Huber) loss and Adam optimizer with Cosine Annealing.
-    """
-
-    def __init__(self, phys_indices, move_indices, n_targets, h_phys=16, h_move=20, h_joint=24, lr=0.015, weight_decay=0.35, epochs=320, seed=42):
+    def __init__(
+        self,
+        phys_indices,
+        move_indices,
+        n_targets,
+        h_phys=16,
+        h_move=20,
+        h_joint=24,
+        lr=0.015,
+        weight_decay=0.35,
+        epochs=300,
+        seed=42,
+    ):
         self.phys_idx = np.asarray(phys_indices, dtype=int)
         self.move_idx = np.asarray(move_indices, dtype=int)
         self.n_targets = n_targets
@@ -605,15 +728,12 @@ class DualBranchCombineNN:
         self.epochs = epochs
         self.seed = seed
 
-        # Preprocessing parameters learned on train fold
         self.col_medians = None
         self.x_mean = None
         self.x_std = None
         self.y_mean = None
         self.y_std = None
-        self.feature_gate = None
-
-        # Network weights
+        self.input_scale = None
         self.params = {}
 
     @staticmethod
@@ -626,7 +746,6 @@ class DualBranchCombineNN:
         Y = np.asarray(Y, dtype=float).copy()
         n, d = X.shape
 
-        # Compute non-missing coverage and in-fold correlation gate (strictly on training fold)
         coverage = np.mean(np.isfinite(X), axis=0)
         self.col_medians = np.zeros(d)
         for j in range(d):
@@ -644,20 +763,10 @@ class DualBranchCombineNN:
         self.y_std[self.y_std < 1e-6] = 1.0
         Ys = (Y - self.y_mean) / self.y_std
 
-        # Target-specific in-fold correlation & coverage attention gate (d, n_targets)
-        # Features with higher training-fold correlation and coverage get stronger skip/input weight
-        corr_mat = np.abs((Xs.T @ Ys) / n)  # (d, n_targets)
-        cov_weight = np.sqrt(np.clip(coverage, 0.15, 1.0))[:, None]
-        raw_gate = (corr_mat ** 1.25) * cov_weight
-        # Keep top-10 features per target active in the skip gate to prevent overfitting on N=150
-        for t in range(self.n_targets):
-            thresh = np.sort(raw_gate[:, t])[-min(10, d)]
-            raw_gate[raw_gate[:, t] < thresh, t] *= 0.10
-        gate_max = np.maximum(1e-4, np.max(raw_gate, axis=0, keepdims=True))
-        self.feature_gate = raw_gate / gate_max
-
-        # Scale Xs by overall multi-task relevance so the hidden branches focus on high-signal inputs
-        input_relevance = np.clip(np.max(corr_mat, axis=1) * np.sqrt(np.clip(coverage, 0.2, 1.0)) * 2.5, 0.30, 1.4)
+        corr_mat = np.abs((Xs.T @ Ys) / n)
+        input_relevance = np.clip(
+            np.max(corr_mat, axis=1) * np.sqrt(np.clip(coverage, 0.2, 1.0)) * 2.5, 0.30, 1.4
+        )
         self.input_scale = input_relevance
         Xs = Xs * self.input_scale[None, :]
         return Xs, Ys
@@ -677,34 +786,33 @@ class DualBranchCombineNN:
         d_m = len(self.move_idx)
         rng = np.random.default_rng(self.seed)
 
-        # Initialize Dual-Branch + Residual Skip parameters
         self.params = {
             "Wp": rng.normal(0.0, np.sqrt(1.0 / max(1, d_p)), size=(d_p, self.h_phys)),
             "bp": np.zeros(self.h_phys),
             "Wm": rng.normal(0.0, np.sqrt(1.0 / max(1, d_m)), size=(d_m, self.h_move)),
             "bm": np.zeros(self.h_move),
-            "Wj": rng.normal(0.0, np.sqrt(1.0 / (self.h_phys + self.h_move)), size=(self.h_phys + self.h_move, self.h_joint)),
+            "Wj": rng.normal(
+                0.0,
+                np.sqrt(1.0 / (self.h_phys + self.h_move)),
+                size=(self.h_phys + self.h_move, self.h_joint),
+            ),
             "bj": np.zeros(self.h_joint),
             "Wo": rng.normal(0.0, 0.15 / np.sqrt(self.h_joint), size=(self.h_joint, self.n_targets)),
             "bo": np.zeros(self.n_targets),
-            # Residual skip connection initialized from regularized Ridge solution for strong stability on N=150
             "W_skip": np.linalg.solve(Xs.T @ Xs + 45.0 * np.eye(d), Xs.T @ Ys),
         }
 
-        # Adam state
         m_state = {k: np.zeros_like(v) for k, v in self.params.items()}
         v_state = {k: np.zeros_like(v) for k, v in self.params.items()}
         beta1, beta2, eps = 0.9, 0.999, 1e-8
-        delta = 1.25  # Huber loss threshold in standardized units
+        delta = 1.25
 
         Xp = Xs[:, self.phys_idx]
         Xm = Xs[:, self.move_idx]
 
         for epoch in range(1, self.epochs + 1):
-            # Cosine annealing learning rate
             lr_t = self.lr * 0.5 * (1.0 + math.cos(math.pi * epoch / self.epochs))
 
-            # Forward pass
             zp = Xp @ self.params["Wp"] + self.params["bp"]
             ap, dap = self._silu(zp)
 
@@ -715,14 +823,11 @@ class DualBranchCombineNN:
             zj = concat_pm @ self.params["Wj"] + self.params["bj"]
             aj, daj = self._silu(zj)
 
-            # Nonlinear residual correction + skip path
             y_pred = aj @ self.params["Wo"] + self.params["bo"] + Xs @ self.params["W_skip"]
 
-            # Smooth-L1 / Huber loss gradient
             err = y_pred - Ys
             grad_out = np.where(np.abs(err) <= delta, err, delta * np.sign(err)) / n
 
-            # Backpropagation
             grads = {}
             grads["Wo"] = aj.T @ grad_out + self.weight_decay * self.params["Wo"]
             grads["bo"] = grad_out.sum(axis=0)
@@ -745,7 +850,6 @@ class DualBranchCombineNN:
             grads["Wm"] = Xm.T @ d_zm + self.weight_decay * self.params["Wm"]
             grads["bm"] = d_zm.sum(axis=0)
 
-            # Adam parameter update
             for k in self.params:
                 m_state[k] = beta1 * m_state[k] + (1.0 - beta1) * grads[k]
                 v_state[k] = beta2 * v_state[k] + (1.0 - beta2) * (grads[k] ** 2)
@@ -767,23 +871,269 @@ class DualBranchCombineNN:
 
         y_pred_std = aj @ self.params["Wo"] + self.params["bo"] + Xs @ self.params["W_skip"]
         y_pred = y_pred_std * self.y_std + self.y_mean
-
-        # Non-negative clipping for count/yardage rate targets (indices 0..4); index 5 is delta YPRR (can be negative)
-        y_pred[:, :5] = np.maximum(0.0, y_pred[:, :5])
+        y_pred[:, NON_NEGATIVE_MASK] = np.maximum(0.0, y_pred[:, NON_NEGATIVE_MASK])
         return y_pred
 
 
 # ---------------------------------------------------------------------------
-# 5-Fold Cross-Validation Ensemble & Feature Importance Engine
+# MODEL FAMILY 2: Bayesian Hierarchical Model (Partial Pooling + ARD + Credible Intervals)
+# ---------------------------------------------------------------------------
+class MultiTargetBayesianHierarchicalModel:
+    """
+    Multi-Target Hierarchical Bayesian Regression featuring:
+      1. Position-group partial pooling prior (shrinks position group means toward global prior)
+      2. Sample-size / exposure precision weighting (weights players by games/routes played)
+      3. Empirical Bayes ARD (Automatic Relevance Determination) feature prior precision
+      4. Analytical posterior mean AND posterior predictive standard deviation (for 10th/90th
+         percentile Floor & Ceiling credible intervals)
+    """
+
+    def __init__(self, alpha_prior=55.0):
+        self.alpha_prior = alpha_prior
+        self.col_medians = None
+        self.x_mean = None
+        self.x_std = None
+        self.global_means = None
+        self.group_priors = {}
+        self.post_covs = []
+        self.beta_posts = []
+        self.sigma2s = []
+
+    def fit(self, X, Y, pos_groups=None, exposure_weights=None):
+        X = np.asarray(X, dtype=float).copy()
+        Y = np.asarray(Y, dtype=float).copy()
+        n, d = X.shape
+        n_targets = Y.shape[1]
+
+        if pos_groups is None:
+            pos_groups = np.where(X[:, 0] > 0.5, "WR", np.where(X[:, 1] > 0.5, "TE", "RB"))
+        if exposure_weights is None:
+            exposure_weights = np.ones(n)
+        w = np.clip(exposure_weights / np.mean(exposure_weights), 0.25, 2.0)
+
+        coverage = np.mean(np.isfinite(X), axis=0)
+        self.col_medians = np.zeros(d)
+        for j in range(d):
+            fin = X[np.isfinite(X[:, j]), j]
+            self.col_medians[j] = float(np.median(fin)) if len(fin) > 0 else 0.0
+            X[~np.isfinite(X[:, j]), j] = self.col_medians[j]
+
+        self.x_mean = np.average(X, axis=0, weights=w)
+        self.x_std = np.sqrt(np.average((X - self.x_mean) ** 2, axis=0, weights=w))
+        self.x_std[self.x_std < 1e-6] = 1.0
+        Xs = np.clip((X - self.x_mean) / self.x_std, -3.5, 3.5)
+
+        self.global_means = np.average(Y, axis=0, weights=w)
+        self.group_priors = {}
+        Y_res = np.zeros_like(Y)
+        for g in np.unique(pos_groups):
+            mask = pos_groups == g
+            n_g = np.sum(w[mask])
+            shrink = n_g / (n_g + 8.0)
+            g_mean = shrink * np.average(Y[mask], axis=0, weights=w[mask]) + (1.0 - shrink) * self.global_means
+            self.group_priors[g] = g_mean
+            Y_res[mask] = Y[mask] - g_mean[None, :]
+
+        W_mat = np.diag(w)
+        XtWX = Xs.T @ W_mat @ Xs
+        self.post_covs = []
+        self.beta_posts = []
+        self.sigma2s = []
+
+        for t in range(n_targets):
+            yt_res = Y_res[:, t]
+            sd_y = max(1e-6, float(np.std(yt_res)))
+            corrs = np.abs((Xs.T @ (w * yt_res)) / (np.sum(w) * sd_y))
+            ard_prec = self.alpha_prior / np.clip(
+                (corrs ** 1.2) * np.sqrt(np.clip(coverage, 0.15, 1.0)) * 3.0, 0.20, 2.5
+            )
+            post_cov = np.linalg.inv(XtWX + np.diag(ard_prec))
+            beta_post = post_cov @ (Xs.T @ (w * yt_res))
+            prior_vec = np.array([self.group_priors.get(g, self.global_means)[t] for g in pos_groups])
+            pred_t = prior_vec + Xs @ beta_post
+            sigma2 = float(np.average((Y[:, t] - pred_t) ** 2, weights=w))
+            self.post_covs.append(post_cov)
+            self.beta_posts.append(beta_post)
+            self.sigma2s.append(sigma2)
+
+        return self
+
+    def predict(self, X, pos_groups=None, return_std=False):
+        X = np.asarray(X, dtype=float).copy()
+        n = len(X)
+        if pos_groups is None:
+            pos_groups = np.where(X[:, 0] > 0.5, "WR", np.where(X[:, 1] > 0.5, "TE", "RB"))
+        for j in range(X.shape[1]):
+            X[~np.isfinite(X[:, j]), j] = self.col_medians[j]
+        Xs = np.clip((X - self.x_mean) / self.x_std, -3.5, 3.5)
+
+        n_targets = len(self.beta_posts)
+        mean_preds = np.zeros((n, n_targets))
+        std_preds = np.zeros((n, n_targets))
+
+        for t in range(n_targets):
+            prior_vec = np.array([self.group_priors.get(g, self.global_means)[t] for g in pos_groups])
+            mean_preds[:, t] = prior_vec + Xs @ self.beta_posts[t]
+            if return_std:
+                epistemic = np.sum((Xs @ self.post_covs[t]) * Xs, axis=1)
+                # Epistemic + aleatoric talent variance across players
+                std_preds[:, t] = np.sqrt(np.maximum(1e-4, self.sigma2s[t] * (0.35 + epistemic)))
+
+        mean_preds[:, NON_NEGATIVE_MASK] = np.maximum(0.0, mean_preds[:, NON_NEGATIVE_MASK])
+        if return_std:
+            return mean_preds, std_preds
+        return mean_preds
+
+
+# ---------------------------------------------------------------------------
+# MODEL FAMILY 3: XGBoost-Style Gradient Boosted Decision Trees (Native Missingness)
+# ---------------------------------------------------------------------------
+class _PureXGBTree:
+    def __init__(self, max_depth=2, min_samples_leaf=8, reg_lambda=10.0, colsample=0.65, rng=None):
+        self.max_depth = max_depth
+        self.min_samples_leaf = min_samples_leaf
+        self.reg_lambda = reg_lambda
+        self.colsample = colsample
+        self.rng = rng if rng is not None else np.random.default_rng(42)
+        self.tree = None
+
+    def _fit_node(self, X, g, depth):
+        n, d = X.shape
+        leaf_val = -np.sum(g) / (n + self.reg_lambda)
+        if depth >= self.max_depth or n < 2 * self.min_samples_leaf:
+            return {"is_leaf": True, "val": float(leaf_val)}
+
+        base_score = (np.sum(g) ** 2) / (n + self.reg_lambda)
+        best_gain = 0.0
+        best_split = None
+
+        feat_indices = self.rng.choice(d, size=max(1, int(d * self.colsample)), replace=False)
+        for j in feat_indices:
+            col = X[:, j]
+            nan_mask = ~np.isfinite(col)
+            valid_mask = ~nan_mask
+            if np.sum(valid_mask) < 2 * self.min_samples_leaf:
+                continue
+            v_col = col[valid_mask]
+            quantiles = np.unique(np.percentile(v_col, [20, 35, 50, 65, 80]))
+            for thresh in quantiles:
+                for nan_go_left in (True, False):
+                    if nan_go_left:
+                        left_m = nan_mask | (col <= thresh)
+                    else:
+                        left_m = valid_mask & (col <= thresh)
+                    n_l = int(np.sum(left_m))
+                    n_r = n - n_l
+                    if n_l < self.min_samples_leaf or n_r < self.min_samples_leaf:
+                        continue
+                    g_l = float(np.sum(g[left_m]))
+                    g_r = float(np.sum(g[~left_m]))
+                    gain = (g_l ** 2) / (n_l + self.reg_lambda) + (g_r ** 2) / (n_r + self.reg_lambda) - base_score
+                    if gain > best_gain:
+                        best_gain = gain
+                        best_split = (j, float(thresh), nan_go_left, left_m)
+
+        if best_split is None or best_gain <= 1e-5:
+            return {"is_leaf": True, "val": float(leaf_val)}
+
+        j, thresh, nan_go_left, left_m = best_split
+        return {
+            "is_leaf": False,
+            "feat": j,
+            "thresh": thresh,
+            "nan_go_left": nan_go_left,
+            "left": self._fit_node(X[left_m], g[left_m], depth + 1),
+            "right": self._fit_node(X[~left_m], g[~left_m], depth + 1),
+        }
+
+    def fit(self, X, g):
+        self.tree = self._fit_node(X, g, 0)
+        return self
+
+    def _pred_one(self, node, x_row):
+        if node["is_leaf"]:
+            return node["val"]
+        v = x_row[node["feat"]]
+        if not np.isfinite(v):
+            go_left = node["nan_go_left"]
+        else:
+            go_left = v <= node["thresh"]
+        return self._pred_one(node["left"] if go_left else node["right"], x_row)
+
+    def predict(self, X):
+        return np.array([self._pred_one(self.tree, row) for row in X])
+
+
+class MultiTargetXGBoostRegressor:
+    """Multi-target XGBoost-style gradient boosted trees with native missing-value split direction learning."""
+
+    def __init__(self, n_estimators=36, lr=0.065, max_depth=2, min_samples_leaf=8, reg_lambda=10.0, subsample=0.8, colsample=0.65, seed=42):
+        self.n_estimators = n_estimators
+        self.lr = lr
+        self.max_depth = max_depth
+        self.min_samples_leaf = min_samples_leaf
+        self.reg_lambda = reg_lambda
+        self.subsample = subsample
+        self.colsample = colsample
+        self.seed = seed
+        self.base_preds = None
+        self.target_trees = []
+
+    def fit(self, X, Y):
+        X = np.asarray(X, dtype=float)
+        Y = np.asarray(Y, dtype=float)
+        n, n_targets = Y.shape
+        self.base_preds = np.mean(Y, axis=0)
+        self.target_trees = []
+
+        for t in range(n_targets):
+            y_t = Y[:, t]
+            pred = np.full(n, self.base_preds[t])
+            rng = np.random.default_rng(self.seed + t * 31)
+            trees = []
+            for _ in range(self.n_estimators):
+                g = pred - y_t
+                sub_idx = rng.choice(n, size=int(n * self.subsample), replace=False)
+                tree = _PureXGBTree(
+                    max_depth=self.max_depth,
+                    min_samples_leaf=self.min_samples_leaf,
+                    reg_lambda=self.reg_lambda,
+                    colsample=self.colsample,
+                    rng=rng,
+                ).fit(X[sub_idx], g[sub_idx])
+                pred += self.lr * tree.predict(X)
+                trees.append(tree)
+            self.target_trees.append(trees)
+        return self
+
+    def predict(self, X):
+        X = np.asarray(X, dtype=float)
+        n = len(X)
+        n_targets = len(self.target_trees)
+        preds = np.tile(self.base_preds, (n, 1))
+        for t, trees in enumerate(self.target_trees):
+            for tree in trees:
+                preds[:, t] += self.lr * tree.predict(X)
+        preds[:, NON_NEGATIVE_MASK] = np.maximum(0.0, preds[:, NON_NEGATIVE_MASK])
+        return preds
+
+
+# ---------------------------------------------------------------------------
+# 5-Fold Cross-Validation Training & Multi-Model Evaluation Suite
 # ---------------------------------------------------------------------------
 def train_and_evaluate_tiers(df, k=5, seed=42):
     """
-    Trains a 5-Fold Cross-Validated ensemble of DualBranchCombineNN models for each
-    Feature Tier, returning out-of-sample predictions, fold uncertainty (std),
-    evaluation metrics (Pearson r, p-val, Spearman rho, MAE), and feature importances.
+    Trains 5-Fold Cross-Validated ensembles of:
+      - Dual-Branch Multi-Task Neural Network
+      - Bayesian Hierarchical Model (with analytical 10th-90th pct Floor/Ceiling intervals)
+      - XGBoost / Gradient Boosted Decision Trees
+      - Hybrid Stack Ensemble (0.45 NN + 0.35 Bayesian + 0.20 XGBoost)
+    across all 3 Feature Tiers and all 11 Targets.
     """
     results = {}
     Y = df[TARGET_COLUMNS].to_numpy(dtype=float)
+    pos_all = df["nfl_position"].values
+    exp_all = np.maximum(1.0, df["career_games"].values)
     n = len(df)
     rng = np.random.default_rng(seed)
     indices = np.arange(n)
@@ -792,43 +1142,83 @@ def train_and_evaluate_tiers(df, k=5, seed=42):
 
     for tier_name, feat_cols in FEATURE_TIERS.items():
         X_df = df[feat_cols]
+        X_raw = X_df.to_numpy(dtype=float, na_value=np.nan)
         phys_idx = [i for i, c in enumerate(feat_cols) if c not in MOVEMENT_FEATURES]
         move_idx = [i for i, c in enumerate(feat_cols) if c in MOVEMENT_FEATURES]
 
-        oof_preds = np.zeros_like(Y)
-        models = []
+        oof_nn = np.zeros_like(Y)
+        oof_bayes = np.zeros_like(Y)
+        oof_bayes_std = np.zeros_like(Y)
+        oof_xgb = np.zeros_like(Y)
+
+        nn_models = []
+        bayes_models = []
+        xgb_models = []
 
         for f_i, val_idx in enumerate(folds):
             train_mask = np.ones(n, dtype=bool)
             train_mask[val_idx] = False
 
-            model = DualBranchCombineNN(
+            # 1. Dual-Branch Multi-Task NN
+            nn_m = DualBranchCombineNN(
                 phys_indices=phys_idx,
                 move_indices=move_idx,
                 n_targets=len(TARGET_COLUMNS),
                 seed=seed + f_i * 17,
+            ).fit(X_raw[train_mask], Y[train_mask])
+            oof_nn[val_idx] = nn_m.predict(X_raw[val_idx])
+            nn_models.append(nn_m)
+
+            # 2. Bayesian Hierarchical Model
+            bay_m = MultiTargetBayesianHierarchicalModel(alpha_prior=55.0).fit(
+                X_raw[train_mask],
+                Y[train_mask],
+                pos_groups=pos_all[train_mask],
+                exposure_weights=exp_all[train_mask],
             )
-            model.fit(X_df.iloc[train_mask].to_numpy(dtype=float, na_value=np.nan), Y[train_mask])
-            oof_preds[val_idx] = model.predict(X_df.iloc[val_idx].to_numpy(dtype=float, na_value=np.nan))
-            models.append(model)
+            b_mean, b_std = bay_m.predict(X_raw[val_idx], pos_groups=pos_all[val_idx], return_std=True)
+            oof_bayes[val_idx] = b_mean
+            oof_bayes_std[val_idx] = b_std
+            bayes_models.append(bay_m)
 
-        # Ensemble prediction & uncertainty across all 5 fold models
-        all_fold_preds = np.stack(
-            [m.predict(X_df.to_numpy(dtype=float, na_value=np.nan)) for m in models], axis=0
-        )
-        ensemble_std = all_fold_preds.std(axis=0)
+            # 3. XGBoost / GBDT
+            xgb_m = MultiTargetXGBoostRegressor(seed=seed + f_i * 13).fit(X_raw[train_mask], Y[train_mask])
+            oof_xgb[val_idx] = xgb_m.predict(X_raw[val_idx])
+            xgb_models.append(xgb_m)
 
-        # Metrics per target
-        metrics = []
-        for t_i, t_col in enumerate(TARGET_COLUMNS):
-            y_true = Y[:, t_i]
-            y_hat = oof_preds[:, t_i]
-            r, p = pearson_r_pval(y_true, y_hat)
-            rho, prho = spearman_rho_pval(y_true, y_hat)
-            mae = float(np.mean(np.abs(y_true - y_hat)))
-            rmse = float(np.sqrt(np.mean((y_true - y_hat) ** 2)))
-            metrics.append(
-                {
+        # 4. Hybrid Stack Ensemble
+        oof_hybrid = 0.45 * oof_nn + 0.35 * oof_bayes + 0.20 * oof_xgb
+
+        oof_by_family = {
+            "Hybrid Stack Ensemble (NN + Bayesian + XGBoost)": oof_hybrid,
+            "Dual-Branch Multi-Task Neural Network": oof_nn,
+            "Bayesian Hierarchical Model (Partial Pooling + Credible Intervals)": oof_bayes,
+            "XGBoost / Gradient Boosted Trees (Native Missingness)": oof_xgb,
+        }
+
+        all_fold_nn = np.stack([m.predict(X_raw) for m in nn_models], axis=0)
+        ensemble_std = all_fold_nn.std(axis=0)
+
+        # Compute 10th-percentile Floor and 90th-percentile Ceiling from Bayesian Posterior Predictive Distribution
+        # (z = ±1.2816 corresponds to 10th and 90th percentiles)
+        bayes_floor_10 = oof_bayes - 1.2816 * oof_bayes_std
+        bayes_floor_10[:, NON_NEGATIVE_MASK] = np.maximum(0.0, bayes_floor_10[:, NON_NEGATIVE_MASK])
+        bayes_ceil_90 = oof_bayes + 1.2816 * oof_bayes_std
+
+        # Metrics across all 4 model families
+        metrics_by_family = {}
+        benchmark_rows = []
+        for fam_name, oof_mat in oof_by_family.items():
+            fam_metrics = []
+            for t_i, t_col in enumerate(TARGET_COLUMNS):
+                y_true = Y[:, t_i]
+                y_hat = oof_mat[:, t_i]
+                r, p = pearson_r_pval(y_true, y_hat)
+                rho, _ = spearman_rho_pval(y_true, y_hat)
+                mae = float(np.mean(np.abs(y_true - y_hat)))
+                rmse = float(np.sqrt(np.mean((y_true - y_hat) ** 2)))
+                item = {
+                    "model_family": fam_name,
                     "target": t_col,
                     "target_label": TARGET_LABELS[t_col],
                     "r": r,
@@ -837,17 +1227,27 @@ def train_and_evaluate_tiers(df, k=5, seed=42):
                     "mae": mae,
                     "rmse": rmse,
                 }
-            )
+                fam_metrics.append(item)
+                benchmark_rows.append(item)
+            metrics_by_family[fam_name] = pd.DataFrame(fam_metrics)
 
-        # Feature sensitivity / effective importance across the 5-fold ensemble
-        importances = compute_feature_importances(models, X_df, feat_cols)
+        importances = compute_feature_importances(nn_models, X_df, feat_cols)
 
         results[tier_name] = {
             "feature_cols": feat_cols,
-            "models": models,
-            "oof_preds": oof_preds,
+            "models": nn_models,
+            "nn_models": nn_models,
+            "bayes_models": bayes_models,
+            "xgb_models": xgb_models,
+            "oof_preds": oof_hybrid,
+            "oof_by_family": oof_by_family,
             "ensemble_std": ensemble_std,
-            "metrics_df": pd.DataFrame(metrics),
+            "bayes_std": oof_bayes_std,
+            "bayes_floor_10": bayes_floor_10,
+            "bayes_ceil_90": bayes_ceil_90,
+            "metrics_df": metrics_by_family["Hybrid Stack Ensemble (NN + Bayesian + XGBoost)"],
+            "metrics_by_family": metrics_by_family,
+            "benchmark_df": pd.DataFrame(benchmark_rows),
             "importances_df": importances,
         }
 
@@ -855,12 +1255,7 @@ def train_and_evaluate_tiers(df, k=5, seed=42):
 
 
 def compute_feature_importances(models, X_df, feat_cols):
-    """
-    Computes standardized perturbation sensitivity (directional & magnitude importance)
-    of each Combine/Movement feature on each target across the 5-fold NN ensemble.
-    """
     X_raw = X_df.to_numpy(dtype=float, na_value=np.nan)
-    base_preds = np.mean([m.predict(X_raw) for m in models], axis=0)
     rows = []
 
     for j, col in enumerate(feat_cols):
@@ -869,12 +1264,12 @@ def compute_feature_importances(models, X_df, feat_cols):
         if not np.isfinite(sd) or sd < 1e-6:
             continue
         X_plus = X_raw.copy()
-        X_Minus = X_raw.copy()
+        X_minus = X_raw.copy()
         X_plus[:, j] = col_vals + 0.5 * sd
-        X_Minus[:, j] = col_vals - 0.5 * sd
+        X_minus[:, j] = col_vals - 0.5 * sd
 
         pred_plus = np.mean([m.predict(X_plus) for m in models], axis=0)
-        pred_minus = np.mean([m.predict(X_Minus) for m in models], axis=0)
+        pred_minus = np.mean([m.predict(X_minus) for m in models], axis=0)
         delta = np.mean(pred_plus - pred_minus, axis=0)
 
         cat = (
@@ -895,12 +1290,49 @@ def compute_feature_importances(models, X_df, feat_cols):
     return pd.DataFrame(rows)
 
 
-def predict_custom_prospect(models, feat_cols, custom_feature_dict):
+def predict_custom_prospect(tier_res_Or_models, feat_cols, custom_feature_dict):
     """
-    Runs a single prospect's feature dictionary through the 5-fold NN ensemble,
-    returning mean predictions and fold confidence intervals (std).
+    Runs a single prospect's feature dictionary through the active tier's model suite,
+    returning predictions across all 4 model families plus Bayesian 10th/90th credible intervals.
     """
     x_vec = np.array([[custom_feature_dict.get(c, np.nan) for c in feat_cols]], dtype=float)
+
+    if isinstance(tier_res_Or_models, dict) and "nn_models" in tier_res_Or_models:
+        nn_models = tier_res_Or_models["nn_models"]
+        bayes_models = tier_res_Or_models["bayes_models"]
+        xgb_models = tier_res_Or_models["xgb_models"]
+
+        nn_folds = np.stack([m.predict(x_vec)[0] for m in nn_models], axis=0)
+        nn_mean = nn_folds.mean(axis=0)
+        nn_std = nn_folds.std(axis=0)
+
+        bay_outs = [m.predict(x_vec, return_std=True) for m in bayes_models]
+        bay_mean = np.mean([o[0][0] for o in bay_outs], axis=0)
+        bay_std = np.mean([o[1][0] for o in bay_outs], axis=0)
+
+        xgb_mean = np.mean([m.predict(x_vec)[0] for m in xgb_models], axis=0)
+        hyb_mean = 0.45 * nn_mean + 0.35 * bay_mean + 0.20 * xgb_mean
+
+        out = {}
+        for i, t_col in enumerate(TARGET_COLUMNS):
+            fl = float(bay_mean[i] - 1.2816 * bay_std[i])
+            if NON_NEGATIVE_MASK[i]:
+                fl = max(0.0, fl)
+            cl = float(bay_mean[i] + 1.2816 * bay_std[i])
+            out[t_col] = {
+                "mean": float(hyb_mean[i]),
+                "std": float(nn_std[i]),
+                "nn": float(nn_mean[i]),
+                "bayesian": float(bay_mean[i]),
+                "xgb": float(xgb_mean[i]),
+                "hybrid": float(hyb_mean[i]),
+                "floor_10": fl,
+                "ceil_90": cl,
+            }
+        return out
+
+    # Fallback if a plain list of NN models was passed
+    models = tier_res_Or_models
     fold_preds = np.stack([m.predict(x_vec)[0] for m in models], axis=0)
     mean_pred = fold_preds.mean(axis=0)
     std_pred = fold_preds.std(axis=0)
@@ -910,26 +1342,94 @@ def predict_custom_prospect(models, feat_cols, custom_feature_dict):
     }
 
 
-def project_player_game(player_row, oof_pred_dict, routes_in_game=20, game_situation="Standard Full Game (Q1-Q4)", is_clutch_close=False):
+def compute_bayesian_season_trajectory(prior_ypg, prior_std, player_games_df, tau_prior_games=6.5):
     """
-    Conditions a player's Neural Network Combine projection on specific game opportunity
-    (routes_in_game) and late-game situation (Standard vs Q4/OT vs Q4 One-Score Clutch).
+    Computes week-by-week Bayesian conjugate Normal-Normal updating of a player's
+    True Yards/Game talent estimate from Week 0 (100% Combine Prior) through each game played:
+      theta_post(k) = (tau_0^-2 * mu_0 + k * sigma^-2 * y_bar_k) / (tau_0^-2 + k * sigma^-2)
+      equivalent to shrinkage weight w_k = k / (k + tau_prior_games) on observed NFL games.
+    Returns a DataFrame with Week 0..K posterior mean, 10th-pct floor, 90th-pct ceiling,
+    and cumulative observed average.
+    """
+    prior_ypg = float(max(2.0, prior_ypg))
+    prior_std = float(max(4.0, prior_std))
+
+    rows = [
+        {
+            "game_num": 0,
+            "game_label": "Pre-Draft (Combine Prior)",
+            "posterior_mean": prior_ypg,
+            "floor_10": max(0.0, prior_ypg - 1.2816 * prior_std),
+            "ceil_90": prior_ypg + 1.2816 * prior_std,
+            "cum_observed_avg": np.nan,
+            "game_actual_yards": np.nan,
+            "prior_weight_pct": 100.0,
+        }
+    ]
+
+    if player_games_df is None or len(player_games_df) == 0:
+        return pd.DataFrame(rows)
+
+    g_sorted = player_games_df.sort_values(["season", "week"]).reset_index(drop=True)
+    cum_yards = 0.0
+    cum_route_equiv = 0.0
+
+    for idx, gr in g_sorted.iterrows():
+        k = idx + 1
+        g_yds = float(gr["total_yards"])
+        # Weight each game's evidence by routes run relative to a standard 18-route game
+        route_eq = max(0.25, float(gr["routes"]) / 18.0)
+        cum_yards += g_yds
+        cum_route_equiv += route_eq
+        obs_avg = cum_yards / k
+
+        # Empirical Bayes precision weight
+        w_obs = cum_route_equiv / (cum_route_equiv + tau_prior_games)
+        post_mean = (1.0 - w_obs) * prior_ypg + w_obs * obs_avg
+        post_std = prior_std * math.sqrt(1.0 - 0.65 * w_obs)
+
+        lbl = f"{int(gr['season'])} W{int(gr['week'])} vs {gr['opponent_abbr']}"
+        rows.append(
+            {
+                "game_num": k,
+                "game_label": lbl,
+                "posterior_mean": float(post_mean),
+                "floor_10": float(max(0.0, post_mean - 1.2816 * post_std)),
+                "ceil_90": float(post_mean + 1.2816 * post_std),
+                "cum_observed_avg": float(obs_avg),
+                "game_actual_yards": g_yds,
+                "prior_weight_pct": float((1.0 - w_obs) * 100.0),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def project_player_game(
+    player_row,
+    oof_pred_dict,
+    routes_in_game=20,
+    game_situation="Standard Full Game (Q1-Q4)",
+    is_clutch_close=False,
+):
+    """
+    Conditions a player's Combine model projection on specific game opportunity (routes_in_game)
+    and late-game situation, returning projected yards, TDs, chain-moving 1st downs, target EPA,
+    and Win Probability Added.
     """
     base_ypg = max(2.0, float(oof_pred_dict["yards_per_game"]))
     base_tdpg = max(0.01, float(oof_pred_dict["tds_per_game"]))
     clutch_ypg = max(1.0, float(oof_pred_dict["clutch_yards_per_game"]))
     q4_tdpg = max(0.005, float(oof_pred_dict["q4_tds_per_game"]))
     q4_exp_pg = max(0.01, float(oof_pred_dict["q4_explosive_per_game"]))
-    clutch_wpa_season = float(oof_pred_dict.get("clutch_wpa_per_season", 0.05))
+    fd_per_100 = max(2.0, float(oof_pred_dict.get("first_downs_per_100_routes", 11.5)))
+    tprr_pct = max(5.0, float(oof_pred_dict.get("tprr_pct", 18.0)))
     delta_ypr = float(player_row.get("q4_vs_q13_ypr_diff_filled", 0.0)) if player_row is not None else 0.0
 
-    # Baseline routes per game across rookie dataset is ~15.1 routes/game (or player's own avg if > 8)
     ref_routes = 16.5
     opp_multiplier = routes_in_game / ref_routes
 
-    # Late-game situational multiplier derived from player's Q4 step-up & clutch profile
     if game_situation == "4th Quarter / Overtime Only":
-        # Projecting a 4th-quarter stint (e.g. 6-12 routes in Q4)
         q4_step_mult = np.clip(1.0 + (delta_ypr / 1.75), 0.75, 1.55)
         proj_yards = (base_ypg / ref_routes) * routes_in_game * q4_step_mult
         proj_tds = ((q4_tdpg / 16.0) / 4.2) * routes_in_game
@@ -945,17 +1445,21 @@ def project_player_game(player_row, oof_pred_dict, routes_in_game=20, game_situa
         explosive_prob = 1.0 - math.exp(-max(0.03, ((q4_exp_pg / 16.0) / 3.5) * routes_in_game * 1.15))
         expected_wpa = proj_tds * 0.28 + (proj_yards / 100.0) * 0.16
     else:
-        # Full Game projection
         clutch_boost = 1.0 + (0.08 * np.clip(delta_ypr, -0.5, 1.0) if is_clutch_close else 0.0)
         proj_yards = base_ypg * opp_multiplier * clutch_boost
         proj_tds = base_tdpg * opp_multiplier * (1.12 if is_clutch_close else 1.0)
         explosive_prob = 1.0 - math.exp(-max(0.05, (proj_yards / 28.0)))
         expected_wpa = proj_tds * (0.22 if is_clutch_close else 0.14) + (proj_yards / 100.0) * 0.08
 
+    proj_first_downs = (fd_per_100 / 100.0) * routes_in_game * (1.08 if is_clutch_close else 1.0)
+    proj_targets = (tprr_pct / 100.0) * routes_in_game
     prob_1plus_td = 1.0 - math.exp(-proj_tds)
+
     return {
         "projected_yards": float(proj_yards),
         "projected_tds": float(proj_tds),
+        "projected_targets": float(proj_targets),
+        "projected_first_downs": float(proj_first_downs),
         "prob_1plus_td": float(prob_1plus_td),
         "prob_explosive_15yd": float(explosive_prob),
         "expected_wpa": float(expected_wpa),
@@ -963,18 +1467,18 @@ def project_player_game(player_row, oof_pred_dict, routes_in_game=20, game_situa
 
 
 if __name__ == "__main__":
-    print("Building Skill Position Combine & Movement dataset from DuckDB...")
+    print("Building Skill Position Combine, Movement & Team-Impact dataset from DuckDB...")
     df, player_games_df, _ = build_skill_position_dataset()
     print(f"Loaded {len(df)} skill-position players and {len(player_games_df)} player-games.")
 
     tier_results = train_and_evaluate_tiers(df, k=5, seed=42)
-    for tier_name, res in tier_results.items():
-        print("\n" + "=" * 90)
-        print(f"5-FOLD OUT-OF-SAMPLE EVALUATION: {tier_name}")
-        print("=" * 90)
-        m_df = res["metrics_df"].copy()
-        m_df["r"] = m_df["r"].round(3)
-        m_df["p_val"] = m_df["p_val"].round(4)
-        m_df["spearman_rho"] = m_df["spearman_rho"].round(3)
-        m_df["mae"] = m_df["mae"].round(3)
-        print(m_df[["target_label", "r", "p_val", "spearman_rho", "mae"]].to_string(index=False))
+    t2 = tier_results["Tier 2: Combine + Movement + NGS Pre-Draft Scores"]
+    print("\n" + "=" * 95)
+    print("5-FOLD CV BENCHMARK (Tier 2: Combine + Movement + NGS Pre-Draft Scores — Hybrid Stack Ensemble)")
+    print("=" * 95)
+    m_df = t2["metrics_df"].copy()
+    m_df["r"] = m_df["r"].round(3)
+    m_df["p_val"] = m_df["p_val"].round(4)
+    m_df["spearman_rho"] = m_df["spearman_rho"].round(3)
+    m_df["mae"] = m_df["mae"].round(3)
+    print(m_df[["target_label", "r", "p_val", "spearman_rho", "mae"]].to_string(index=False))

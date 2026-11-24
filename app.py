@@ -393,38 +393,57 @@ elif nav_choice == "💡 Quick Query Guide":
     """)
 
 # -------------------------------------------------------------
-# TAB 5: SKILL POSITION NEURAL NET & LATE-GAME CLUTCH PROJECTOR
+# TAB 5: SKILL POSITION MULTI-MODEL, CLUTCH & TEAM IMPACT SUITE
 # -------------------------------------------------------------
 elif nav_choice == "🧠 Skill Position Neural Net & Clutch Projector":
-    st.header("🧠 Skill Position Combine & Movement Neural Network")
+    st.header("🧠 Skill Position Multi-Model, Clutch & Team-Impact Projector")
     st.markdown(
-        "Dual-Branch Multi-Task Neural Network projecting **Rookie Per-Game Yards & Touchdowns**, "
-        "**4th-Quarter & Clutch Late-Game Scoring**, and **Single-Game Situational Output** from "
-        "NFL Combine measurements (`combine_results`) and 147,067 frame-by-frame Combine drill movement trajectories (`combine_tracking`)."
+        "Compare **4 Model Families** (**Hybrid Stack Ensemble**, **Dual-Branch Multi-Task Neural Net**, "
+        "**Bayesian Hierarchical Partial-Pooling Model**, and **XGBoost / GBDT**) across **11 Targets**: "
+        "Rookie Box-Score Production, **4th-Quarter Clutch Scoring**, and **Beyond-Box-Score Team Impact & Offensive Gravity** "
+        "(Chain-Moving 1st Downs, 3rd/4th Down Conversions, Target EPA, Target-Earning Rate `TPRR%`, and Decoy Non-Target Team EPA)."
     )
 
-    with st.spinner("Training 5-Fold Dual-Branch Neural Network Ensemble on DuckDB Combine & Tracking data..."):
+    with st.spinner("Training 5-Fold Ensembles (Dual-Branch NN + Bayesian Hierarchical + XGBoost/GBDT)..."):
         df_players, df_games, df_tracking, tier_results = load_skill_nn_bundle()
 
-    tier_names = list(spnn.FEATURE_TIERS.keys())
-    selected_tier = st.selectbox(
-        "🎚️ Select Neural Network Input Feature Tier:",
-        tier_names,
-        index=1,
-        help="Compare Pure Physical + Movement Tracking (Tier 1) against adding NGS Pre-Draft Scores (Tier 2) or Draft Capital (Tier 3).",
-    )
+    top_c1, top_c2 = st.columns([1.15, 1])
+    with top_c1:
+        selected_model_family = st.selectbox(
+            "🤖 Select Active Model Architecture:",
+            spnn.MODEL_FAMILIES,
+            index=0,
+            help=(
+                "Switch live predictions between the Hybrid Stack Ensemble, Dual-Branch Neural Network, "
+                "Bayesian Hierarchical Model (with analytical 10th/90th percentile Floor & Ceiling credible intervals), "
+                "and XGBoost/GBDT (with native missing-value split routing)."
+            ),
+        )
+    with top_c2:
+        tier_names = list(spnn.FEATURE_TIERS.keys())
+        selected_tier = st.selectbox(
+            "🎚️ Select Pre-Draft Feature Tier:",
+            tier_names,
+            index=1,
+            help="Compare Pure Physical + Movement Tracking (Tier 1) against adding NGS Pre-Draft Scores (Tier 2) or Draft Capital (Tier 3).",
+        )
 
     active_res = tier_results[selected_tier]
-    oof_preds = active_res["oof_preds"]
+    oof_preds = active_res["oof_by_family"][selected_model_family]
     fold_stds = active_res["ensemble_std"]
+    bayes_std = active_res["bayes_std"]
+    bayes_floor = active_res["bayes_floor_10"]
+    bayes_ceil = active_res["bayes_ceil_90"]
 
-    # Attach out-of-sample predictions to player dataframe copy
     view_df = df_players.copy()
     for t_i, t_col in enumerate(spnn.TARGET_COLUMNS):
         view_df[f"pred_{t_col}"] = oof_preds[:, t_i]
         view_df[f"std_{t_col}"] = fold_stds[:, t_i]
+        view_df[f"bstd_{t_col}"] = bayes_std[:, t_i]
+        view_df[f"floor10_{t_col}"] = bayes_floor[:, t_i]
+        view_df[f"ceil90_{t_col}"] = bayes_ceil[:, t_i]
 
-    # Compute a 0-100 Composite Late-Game Clutch Athlete Percentile
+    # Composite 0-100 Late-Game Clutch Athlete Percentile
     clutch_raw = (
         0.35 * view_df["pred_q4_tds_per_game"].rank(pct=True)
         + 0.35 * view_df["pred_q4_explosive_per_game"].rank(pct=True)
@@ -432,15 +451,36 @@ elif nav_choice == "🧠 Skill Position Neural Net & Clutch Projector":
     )
     view_df["clutch_percentile"] = (clutch_raw * 100.0).round(1)
 
-    sub_tab1, sub_tab2, sub_tab3, sub_tab4 = st.tabs([
-        "🎯 Player Game & Clutch Projector",
-        "🏆 Rookie & Late-Game Leaderboards",
+    # Composite 0-100 Beyond-Box-Score Team Impact & Offensive Gravity Percentile
+    impact_raw = (
+        0.25 * view_df["pred_first_downs_per_100_routes"].rank(pct=True)
+        + 0.25 * view_df["pred_third_fourth_conv_per_season"].rank(pct=True)
+        + 0.20 * view_df["pred_target_epa_per_season"].rank(pct=True)
+        + 0.15 * view_df["pred_tprr_pct"].rank(pct=True)
+        + 0.15 * view_df["pred_gravity_non_target_epa_100"].rank(pct=True)
+    )
+    view_df["team_impact_percentile"] = (impact_raw * 100.0).round(1)
+
+    # Actual observed Team Impact composite percentile for comparison
+    actual_impact_raw = (
+        0.25 * view_df["first_downs_per_100_routes"].rank(pct=True)
+        + 0.25 * view_df["third_fourth_conv_per_season"].rank(pct=True)
+        + 0.20 * view_df["target_epa_per_season"].rank(pct=True)
+        + 0.15 * view_df["tprr_pct"].rank(pct=True)
+        + 0.15 * view_df["gravity_non_target_epa_100"].rank(pct=True)
+    )
+    view_df["actual_impact_percentile"] = (actual_impact_raw * 100.0).round(1)
+
+    sub_tab1, sub_tab2, sub_tab3, sub_tab4, sub_tab5 = st.tabs([
+        "🎯 Player Game, Bayesian & Clutch Projector",
+        "🌐 Team Impact & Offensive Gravity Lab",
+        "🏆 Leaderboards & Model Predictions",
         "🧪 Custom Prospect 'What-If' Lab",
-        "🔬 NN Architecture & Signal Proof",
+        "🔬 Multi-Model Benchmark & Signal Proof",
     ])
 
     # =========================================================
-    # SUB-TAB 1: PLAYER GAME & LATE-GAME CLUTCH PROJECTOR
+    # SUB-TAB 1: PLAYER GAME, BAYESIAN & CLUTCH PROJECTOR
     # =========================================================
     with sub_tab1:
         col_sel1, col_sel2, col_sel3 = st.columns([2, 1, 1])
@@ -468,7 +508,6 @@ elif nav_choice == "🧠 Skill Position Neural Net & Clutch Projector":
         sel_id = id_map[selected_opt]
         p_row = view_df[view_df["nfl_id"] == sel_id].iloc[0]
 
-        # Player Bio Banner
         draft_str = (
             f"Round {int(p_row['draft_round'])}, Pick #{int(p_row['draft_overall_pick'])}"
             if pd.notna(p_row["draft_overall_pick"])
@@ -489,21 +528,25 @@ elif nav_choice == "🧠 Skill Position Neural Net & Clutch Projector":
             f"**Draft ({int(p_row['draft_year'])}):** `{draft_str}` &nbsp;|&nbsp; "
             f"**40-Yd:** `{forty_str}` &nbsp;|&nbsp; **40-Yd P90 Accel:** `{tr40_a_str}` &nbsp;|&nbsp; "
             f"**Go-Route Peak Accel:** `{go_a_str}` &nbsp;|&nbsp; **Slant Speed:** `{slant_s_str}` &nbsp;|&nbsp; "
-            f"**Clutch Athlete Score:** `{p_row['clutch_percentile']:.1f}th pct`"
+            f"**Clutch Score:** `{p_row['clutch_percentile']:.1f}th pct` &nbsp;|&nbsp; "
+            f"**Team Impact & Gravity Score:** `{p_row['team_impact_percentile']:.1f}th pct`"
         )
 
-        st.subheader("📊 Out-of-Sample Neural Net Projection vs. Actual NFL Output")
+        st.subheader(f"📊 Box-Score & 4th-Quarter Clutch Projections (`{selected_model_family}`)")
+        st.caption(
+            "Includes **Bayesian 80% Credible Intervals** (`10th-pct Floor` to `90th-pct Ceiling`) alongside out-of-sample predictions."
+        )
         m1, m2, m3, m4, m5, m6 = st.columns(6)
         m1.metric(
-            "Projected Rookie Yds/G",
-            f"{p_row['pred_yards_per_game']:.1f} ± {p_row['std_yards_per_game']:.1f}",
-            delta=f"Actual: {p_row['yards_per_game']:.1f} yd/g",
+            "Proj Rookie Yds/G",
+            f"{p_row['pred_yards_per_game']:.1f} yd/g",
+            delta=f"Actual: {p_row['yards_per_game']:.1f} (80% CI: {p_row['floor10_yards_per_game']:.0f}–{p_row['ceil90_yards_per_game']:.0f})",
             delta_color="off",
         )
         m2.metric(
-            "Projected Rookie TDs/G",
-            f"{p_row['pred_tds_per_game']:.2f} ± {p_row['std_tds_per_game']:.2f}",
-            delta=f"Actual: {p_row['tds_per_game']:.2f} td/g",
+            "Proj Rookie TDs/G",
+            f"{p_row['pred_tds_per_game']:.2f} td/g",
+            delta=f"Actual: {p_row['tds_per_game']:.2f} (80% CI: {p_row['floor10_tds_per_game']:.2f}–{p_row['ceil90_tds_per_game']:.2f})",
             delta_color="off",
         )
         m3.metric(
@@ -533,13 +576,123 @@ elif nav_choice == "🧠 Skill Position Neural Net & Clutch Projector":
             delta_color="off",
         )
 
+        st.subheader("🌐 Beyond-Box-Score Team Impact & Offensive Gravity Scorecard")
+        ti1, ti2, ti3, ti4, ti5, ti6 = st.columns(6)
+        ti1.metric(
+            "Chain-Moving: 1st Dns/100 Rts",
+            f"{p_row['pred_first_downs_per_100_routes']:.1f}",
+            delta=f"Actual: {p_row['first_downs_per_100_routes']:.1f} / 100 rts",
+            delta_color="off",
+        )
+        ti2.metric(
+            "Money Downs: 3rd/4th Conv/Yr",
+            f"{p_row['pred_third_fourth_conv_per_season']:.1f}",
+            delta=f"Actual: {p_row['third_fourth_conv_per_season']:.1f} conv/yr",
+            delta_color="off",
+        )
+        ti3.metric(
+            "Target EPA / Season",
+            f"{p_row['pred_target_epa_per_season']:+.1f} EPA",
+            delta=f"Actual: {p_row['target_epa_per_season']:+.1f} EPA/yr",
+            delta_color="off",
+        )
+        ti4.metric(
+            "Target-Earning Rate (TPRR)",
+            f"{p_row['pred_tprr_pct']:.1f}%",
+            delta=f"Actual: {p_row['tprr_pct']:.1f}% of routes",
+            delta_color="off",
+        )
+        ti5.metric(
+            "Gravity: Decoy EPA/100 Snaps",
+            f"{p_row['pred_gravity_non_target_epa_100']:+.2f} EPA",
+            delta=f"Actual: {p_row['gravity_non_target_epa_100']:+.2f} EPA/100",
+            delta_color="off",
+        )
+        ti6.metric(
+            "YAC Over Expected (YACOE)",
+            f"{p_row['yacoe_per_catch']:+.2f} yd/rec",
+            delta=f"Motion Rate: {p_row['motion_rate_pct']:.1f}%",
+            delta_color="off",
+        )
+
+        st.markdown("---")
+        # Bayesian In-Season Belief Updating Chart (Week 0 Combine Prior -> Week K Posterior)
+        p_games = df_games[df_games["nfl_id"] == sel_id].sort_values(["season", "week"]).copy()
+        st.subheader(f"📈 Bayesian Hierarchical Belief Updating: {p_row['display_name']} (Week 0 Combine Prior → NFL Posterior)")
+        st.caption(
+            "Solves the small-sample rookie problem: at Week 0, our estimate is 100% anchored to the player's **Combine & Movement Prior** "
+            "with its 80% credible interval (`10th–90th percentile`). As the player logs NFL routes each week, Bayes' rule partially pools "
+            "the Combine Prior with cumulative NFL evidence."
+        )
+        bayes_traj_df = spnn.compute_bayesian_season_trajectory(
+            prior_ypg=p_row["pred_yards_per_game"],
+            prior_std=p_row["bstd_yards_per_game"],
+            player_games_df=p_games,
+            tau_prior_games=6.5,
+        )
+        fig_bay = go.Figure()
+        fig_bay.add_trace(
+            go.Scatter(
+                x=bayes_traj_df["game_label"],
+                y=bayes_traj_df["ceil_90"],
+                mode="lines",
+                line=dict(width=0),
+                showlegend=False,
+                hoverinfo="skip",
+            )
+        )
+        fig_bay.add_trace(
+            go.Scatter(
+                x=bayes_traj_df["game_label"],
+                y=bayes_traj_df["floor_10"],
+                mode="lines",
+                line=dict(width=0),
+                fill="tonexty",
+                fillcolor="rgba(31, 119, 180, 0.18)",
+                name="Bayesian 80% Credible Band (10th–90th Pct)",
+            )
+        )
+        fig_bay.add_trace(
+            go.Scatter(
+                x=bayes_traj_df["game_label"],
+                y=bayes_traj_df["posterior_mean"],
+                mode="lines+markers",
+                line=dict(color="#1f77b4", width=3),
+                name="Bayesian Posterior True Talent (Yds/G)",
+            )
+        )
+        if len(p_games) > 0:
+            fig_bay.add_trace(
+                go.Scatter(
+                    x=bayes_traj_df["game_label"],
+                    y=bayes_traj_df["cum_observed_avg"],
+                    mode="lines+markers",
+                    line=dict(color="#2ca02c", width=2, dash="dot"),
+                    name="Unshrunk Cumulative NFL Average",
+                )
+            )
+        fig_bay.add_hline(
+            y=float(p_row["pred_yards_per_game"]),
+            line_dash="dash",
+            line_color="#ff7f0e",
+            annotation_text="Pre-Draft Combine Prior",
+        )
+        fig_bay.update_layout(
+            height=340,
+            margin=dict(l=20, r=20, t=35, b=20),
+            xaxis_title="Career Progression (Pre-Draft Combine Prior → Game-by-Game Posterior)",
+            yaxis_title="Estimated True Yards / Game",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        )
+        st.plotly_chart(fig_bay, use_container_width=True)
+
         st.markdown("---")
         # Interactive Game Situation Simulator + Actual Game Log
         sim_col1, sim_col2 = st.columns([1, 1.35])
         with sim_col1:
             st.subheader("🕹️ Single-Game & Late-Game Clutch Simulator")
             st.caption(
-                "Condition this player's Combine Neural Network embedding on specific game opportunity and 4th-quarter leverage."
+                f"Condition this player's `{selected_model_family}` projection on game route volume and 4th-quarter leverage."
             )
             default_routes = int(np.clip(round(p_row["routes_per_game"]) if p_row["routes_per_game"] > 0 else 18, 4, 45))
             sim_situation = st.radio(
@@ -569,13 +722,13 @@ elif nav_choice == "🧠 Skill Position Neural Net & Clutch Projector":
             sc2.metric("Expected Touchdowns", f"{game_proj['projected_tds']:.2f} TDs")
             sc3.metric("1+ Touchdown Prob", f"{game_proj['prob_1plus_td']*100:.1f}%")
 
-            sc4, sc5 = st.columns(2)
-            sc4.metric("15+ Yd Explosive Play Prob", f"{game_proj['prob_explosive_15yd']*100:.1f}%")
-            sc5.metric("Expected Win Prob Added (WPA)", f"+{game_proj['expected_wpa']*100:.1f}%")
+            sc4, sc5, sc6 = st.columns(3)
+            sc4.metric("Expected 1st Downs", f"{game_proj['projected_first_downs']:.2f} 1D")
+            sc5.metric("15+ Yd Explosive Prob", f"{game_proj['prob_explosive_15yd']*100:.1f}%")
+            sc6.metric("Expected WPA", f"+{game_proj['expected_wpa']*100:.1f}%")
 
         with sim_col2:
             st.subheader(f"📅 {p_row['display_name']} — Game-by-Game Projected vs. Actual Log")
-            p_games = df_games[df_games["nfl_id"] == sel_id].sort_values(["season", "week"]).copy()
             if len(p_games) == 0:
                 st.warning("No offensive game snaps recorded in `player_play` for this player.")
             else:
@@ -591,8 +744,8 @@ elif nav_choice == "🧠 Skill Position Neural Net & Clutch Projector":
                     )
                     proj_g_yds.append(round(gp["projected_yards"], 1))
                     proj_g_tds.append(round(gp["projected_tds"], 2))
-                p_games["nn_proj_yards"] = proj_g_yds
-                p_games["nn_proj_tds"] = proj_g_tds
+                p_games["model_proj_yards"] = proj_g_yds
+                p_games["model_proj_tds"] = proj_g_tds
                 p_games["game_label"] = (
                     p_games["season"].astype(str)
                     + " W"
@@ -613,17 +766,17 @@ elif nav_choice == "🧠 Skill Position Neural Net & Clutch Projector":
                 fig_g.add_trace(
                     go.Scatter(
                         x=p_games["game_label"],
-                        y=p_games["nn_proj_yards"],
-                        name="NN Projected Yards (given game routes)",
+                        y=p_games["model_proj_yards"],
+                        name="Model Projected Yards (given game routes)",
                         mode="lines+markers",
                         line=dict(color="#ff7f0e", width=3),
                     )
                 )
                 fig_g.update_layout(
-                    title=f"{p_row['display_name']}: Game-by-Game Actual vs. Combine NN Projected Yards",
+                    title=f"{p_row['display_name']}: Game-by-Game Actual vs. Projected Yards",
                     xaxis_title="Game",
                     yaxis_title="Scrimmage Yards",
-                    height=330,
+                    height=310,
                     margin=dict(l=20, r=20, t=40, b=20),
                     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
                 )
@@ -637,12 +790,12 @@ elif nav_choice == "🧠 Skill Position Neural Net & Clutch Projector":
                     "targets",
                     "catches",
                     "total_yards",
-                    "nn_proj_yards",
-                    "tds",
-                    "nn_proj_tds",
+                    "model_proj_yards",
+                    "first_downs",
+                    "money_down_conv",
+                    "target_epa",
                     "q4_yards",
                     "q4_tds",
-                    "clutch_wpa",
                 ]
                 st.dataframe(p_games[display_g_cols].round(2), width="stretch", height=210)
 
@@ -701,10 +854,104 @@ elif nav_choice == "🧠 Skill Position Neural Net & Clutch Projector":
                 st.plotly_chart(fig_kin, use_container_width=True)
 
     # =========================================================
-    # SUB-TAB 2: ROOKIE & LATE-GAME CLUTCH LEADERBOARDS
+    # SUB-TAB 2: TEAM IMPACT & OFFENSIVE GRAVITY LAB
     # =========================================================
     with sub_tab2:
-        st.subheader("🏆 Rookie & Late-Game Clutch Projections vs. Actual NFL Performance")
+        st.subheader("🌐 Beyond Box-Score: Team Impact & Offensive Gravity Lab")
+        st.markdown(
+            "Raw yardage and touchdowns miss how a skill player impacts drives and teammates. "
+            "This lab models **5 true team-impact dimensions** directly from `player_play` and `combine_tracking`:\n"
+            "1. **Chain-Moving Efficiency (`1st Downs / 100 Routes`)** — predicted by *Play Speed Ratio (`route_to_40_speed_ratio`, `r = +0.339`)* & *Dagger-Route Accel (`r = +0.314`)*.\n"
+            "2. **Money-Down Conversions (`3rd & 4th Down Conversions / Season`)** — predicted by *Combine Agility (`3-Cone + Short Shuttle`, `r = -0.509`)*.\n"
+            "3. **Value Creation (`Target EPA / Season`)** — Expected Points Added on targets, weighting 3rd-down & red-zone conversions over empty yardage.\n"
+            "4. **Target-Earning Power (`TPRR %`)** — Targets earned per 100 routes run.\n"
+            "5. **Offensive Gravity (`Decoy Non-Target Team EPA / 100 Snaps`)** — How much the team's offense gains on plays where this player is on the field running a route **even when the ball goes to a teammate** (predicted by *Deep Over-Shoulder & Slant Route Speed, `r = +0.243`*)."
+        )
+
+        g_c1, g_c2, g_c3 = st.columns(3)
+        with g_c1:
+            x_imp = st.selectbox(
+                "X-Axis Metric:",
+                ["yards_per_game", "pred_team_impact_Or_gravity"] + spnn.TEAM_IMPACT_TARGETS,
+                index=0,
+                format_func=lambda c: (
+                    "Rookie Yards / Game (Box Score)"
+                    if c == "yards_per_game"
+                    else ("Projected Team Impact Percentile" if c == "pred_team_impact_Or_gravity" else spnn.TARGET_LABELS.get(c, c))
+                ),
+            )
+        with g_c2:
+            y_imp = st.selectbox(
+                "Y-Axis Team-Impact Metric:",
+                spnn.TEAM_IMPACT_TARGETS + ["yacoe_per_catch", "actual_impact_percentile"],
+                index=0,
+                format_func=lambda c: (
+                    "YAC Over Expected / Catch (YACOE)"
+                    if c == "yacoe_per_catch"
+                    else ("Actual Composite Team Impact Percentile (0-100)" if c == "actual_impact_percentile" else spnn.TARGET_LABELS.get(c, c))
+                ),
+            )
+        with g_c3:
+            min_rts = st.slider("Minimum Career Routes Run Filter:", 0, 200, 40, 10)
+
+        imp_sub = view_df[view_df["career_total_routes"] >= min_rts].copy()
+        x_col_actual = "team_impact_percentile" if x_imp == "pred_team_impact_Or_gravity" else x_imp
+
+        fig_grav = px.scatter(
+            imp_sub,
+            x=x_col_actual,
+            y=y_imp,
+            color="nfl_position",
+            size=np.maximum(3.0, imp_sub["team_impact_percentile"]),
+            hover_name="display_name",
+            hover_data=[
+                "draft_year",
+                "college_name",
+                "yards_per_game",
+                "first_downs_per_100_routes",
+                "third_fourth_conv_per_season",
+                "target_epa_per_season",
+                "gravity_non_target_epa_100",
+                "yacoe_per_catch",
+                "team_impact_percentile",
+            ],
+            title=f"Skill Player Team Impact: {x_col_actual} vs. {spnn.TARGET_LABELS.get(y_imp, y_imp)} (Size = Projected Team Impact Score)",
+        )
+        fig_grav.update_layout(height=440)
+        st.plotly_chart(fig_grav, use_container_width=True)
+
+        grav_cols = [
+            "display_name",
+            "nfl_position",
+            "draft_year",
+            "career_total_routes",
+            "team_impact_percentile",
+            "actual_impact_percentile",
+            "pred_first_downs_per_100_routes",
+            "first_downs_per_100_routes",
+            "pred_third_fourth_conv_per_season",
+            "third_fourth_conv_per_season",
+            "pred_target_epa_per_season",
+            "target_epa_per_season",
+            "pred_tprr_pct",
+            "tprr_pct",
+            "pred_gravity_non_target_epa_100",
+            "gravity_non_target_epa_100",
+            "yacoe_per_catch",
+            "motion_rate_pct",
+            "yards_per_game",
+        ]
+        st.dataframe(
+            imp_sub[grav_cols].sort_values("team_impact_percentile", ascending=False).round(2),
+            width="stretch",
+            height=380,
+        )
+
+    # =========================================================
+    # SUB-TAB 3: LEADERBOARDS & MODEL PREDICTIONS
+    # =========================================================
+    with sub_tab3:
+        st.subheader(f"🏆 All 11 Targets Leaderboard (`{selected_model_family}`)")
         lb_c1, lb_c2, lb_c3 = st.columns(3)
         with lb_c1:
             target_plot_col = st.selectbox(
@@ -733,17 +980,24 @@ elif nav_choice == "🧠 Skill Position Neural Net & Clutch Projector":
             color="nfl_position",
             size=np.maximum(2.0, lb_df["games_played"]),
             hover_name="display_name",
-            hover_data=["draft_year", "college_name", "draft_overall_pick", "forty", "drill_go_route_max_a", "clutch_percentile"],
+            hover_data=[
+                "draft_year",
+                "college_name",
+                "draft_overall_pick",
+                f"floor10_{target_plot_col}",
+                f"ceil90_{target_plot_col}",
+                "clutch_percentile",
+                "team_impact_percentile",
+            ],
             title=(
-                f"Out-of-Sample NN Projected vs. Actual {spnn.TARGET_LABELS[target_plot_col]} "
+                f"Out-of-Sample Projected vs. Actual {spnn.TARGET_LABELS[target_plot_col]} "
                 f"(Pearson r = {r_val:.3f}, p = {p_val:.4f} | Spearman ρ = {rho_val:.3f})"
             ),
             labels={
-                f"pred_{target_plot_col}": f"NN Out-of-Sample Projected {spnn.TARGET_LABELS[target_plot_col]}",
+                f"pred_{target_plot_col}": f"Out-of-Sample Projected {spnn.TARGET_LABELS[target_plot_col]}",
                 target_plot_col: f"Actual {spnn.TARGET_LABELS[target_plot_col]}",
             },
         )
-        # Add 1:1 reference line
         min_v = float(min(lb_df[f"pred_{target_plot_col}"].min(), lb_df[target_plot_col].min()))
         max_v = float(max(lb_df[f"pred_{target_plot_col}"].max(), lb_df[target_plot_col].max()))
         fig_sc.add_trace(
@@ -755,7 +1009,7 @@ elif nav_choice == "🧠 Skill Position Neural Net & Clutch Projector":
                 line=dict(color="gray", dash="dash"),
             )
         )
-        fig_sc.update_layout(height=450)
+        fig_sc.update_layout(height=440)
         st.plotly_chart(fig_sc, use_container_width=True)
 
         lb_cols = [
@@ -765,47 +1019,50 @@ elif nav_choice == "🧠 Skill Position Neural Net & Clutch Projector":
             "college_name",
             "draft_overall_pick",
             "clutch_percentile",
+            "team_impact_percentile",
+            f"pred_{target_plot_col}",
+            f"floor10_{target_plot_col}",
+            f"ceil90_{target_plot_col}",
+            target_plot_col,
             "pred_yards_per_game",
             "yards_per_game",
             "pred_tds_per_game",
             "tds_per_game",
-            "pred_q4_tds_per_game",
-            "q4_tds_per_game",
             "pred_q4_explosive_per_game",
             "q4_explosive_per_game",
-            "pred_clutch_yards_per_game",
-            "clutch_yards_per_game",
-            "pred_clutch_wpa_per_season",
-            "clutch_wpa_per_season",
-            "q4_vs_q13_ypr_diff",
-            "forty",
-            "three_cone",
-            "hand_size",
-            "drill_go_route_max_a",
-            "tr40_p90_a",
-            "drill_slant_ro_max_s",
-            "route_to_40_speed_ratio",
+            "pred_first_downs_per_100_routes",
+            "first_downs_per_100_routes",
+            "pred_third_fourth_conv_per_season",
+            "third_fourth_conv_per_season",
+            "pred_target_epa_per_season",
+            "target_epa_per_season",
+            "pred_tprr_pct",
+            "tprr_pct",
+            "pred_gravity_non_target_epa_100",
+            "gravity_non_target_epa_100",
         ]
+        # Deduplicate columns while preserving order
+        lb_cols = list(dict.fromkeys(lb_cols))
         lb_sorted = lb_df[lb_cols].sort_values(f"pred_{target_plot_col}", ascending=False).round(3)
         st.dataframe(lb_sorted, width="stretch", height=400)
 
         csv_lb = lb_sorted.to_csv(index=False).encode("utf-8")
         st.download_button(
-            "📥 Download Full Skill Position NN Projections (CSV)",
+            "📥 Download Full Multi-Model & Team Impact Projections (CSV)",
             data=csv_lb,
-            file_name="skill_position_nn_projections.csv",
+            file_name="skill_position_multimodel_projections.csv",
             mime="text/csv",
         )
 
     # =========================================================
-    # SUB-TAB 3: CUSTOM PROSPECT "WHAT-IF" NEURAL NET LAB
+    # SUB-TAB 4: CUSTOM PROSPECT "WHAT-IF" LAB (ALL 4 MODELS)
     # =========================================================
-    with sub_tab3:
-        st.subheader("🧪 Custom Prospect 'What-If' Combine & Movement Simulator")
+    with sub_tab4:
+        st.subheader("🧪 Custom Prospect 'What-If' Combine & Movement Simulator (All 4 Model Families)")
         st.markdown(
             "Load any player's Combine profile as a template, then adjust **Combine Physical Measurables** or "
-            "**Combine Drill Tracking Kinematics** to see how the 5-Fold Neural Network Ensemble updates their "
-            "projected **Rookie Yards/Game, TDs/Game, and 4th-Quarter Clutch Scoring**."
+            "**Combine Drill Tracking Kinematics** to see live forward-pass predictions across **all 4 model families** "
+            "(**Hybrid Ensemble**, **Dual-Branch NN**, **Bayesian Hierarchical + 80% Credible Interval**, and **XGBoost/GBDT**)."
         )
 
         template_opt = st.selectbox("Load Template Player Profile:", player_options, key="whatif_template")
@@ -825,7 +1082,7 @@ elif nav_choice == "🧠 Skill Position Neural Net & Clutch Projector":
             w_arm = st.slider("Arm Length (inches):", 29.0, 35.5, _val("arm_length", 32.0), 0.25)
             w_wing = st.slider("Wingspan (inches):", 70.0, 85.0, _val("wing_span", 77.0), 0.25)
             w_forty = st.slider("40-Yard Dash (s):", 4.21, 4.95, _val("forty", 4.46), 0.01)
-            w_3cone = st.slider("3-Cone Drill (s):", 6.40, 7.60, _val("three_cone", 6.95), 0.01)
+            w_3cone = st.slider("3-Cone Drill (s — Money-Down Trait):", 6.40, 7.60, _val("three_cone", 6.95), 0.01)
             w_shuttle = st.slider("Short Shuttle (s):", 3.90, 4.65, _val("short_shuttle", 4.25), 0.01)
 
         with w_c2:
@@ -835,7 +1092,7 @@ elif nav_choice == "🧠 Skill Position Neural Net & Clutch Projector":
             w_tr40_tang_a = st.slider("40-Yd Peak Tangential Accel (yd/s²):", 3.5, 9.5, _val("tr40_max_tang_a", 6.3), 0.1)
             w_tr40_mean_s = st.slider("40-Yd Tracking Mean Speed (yd/s):", 4.5, 8.2, _val("tr40_mean_s", 6.4), 0.05)
             w_gauntlet_a = st.slider("Gauntlet Drill Peak Accel (yd/s²):", 3.0, 9.0, _val("drill_gauntlet_max_a", 5.5), 0.1)
-            w_slant_s = st.slider("Slant Route Peak Speed (yd/s — Q4 Explosive):", 5.5, 9.8, _val("drill_slant_ro_max_s", 7.8), 0.05)
+            w_slant_s = st.slider("Slant Route Peak Speed (yd/s — Q4 & Gravity):", 5.5, 9.8, _val("drill_slant_ro_max_s", 7.8), 0.05)
             w_route_max_s = st.slider("All-Route Peak Speed (yd/s):", 6.5, 10.8, _val("trroute_max_s", 8.8), 0.05)
             w_centrip = st.slider("Route Centripetal Cut Accel (yd/s²):", 5.0, 22.0, _val("trroute_max_centrip", 12.5), 0.25)
 
@@ -848,7 +1105,6 @@ elif nav_choice == "🧠 Skill Position Neural Net & Clutch Projector":
             w_ngs_fin = st.slider("NGS Final Pre-Draft Score:", 50.0, 99.0, _val("ngs_final_score", 77.0), 1.0)
             w_pick = st.slider("Draft Overall Pick #:", 1.0, 260.0, _val("draft_overall_pick", 65.0), 1.0)
 
-        # Build custom dictionary starting from template player's full vector and overriding modified traits
         custom_dict = t_row.to_dict()
         custom_dict.update({
             "is_wr": 1.0 if w_pos == "WR" else 0.0,
@@ -884,52 +1140,60 @@ elif nav_choice == "🧠 Skill Position Neural Net & Clutch Projector":
             "draft_round": float(min(7, max(1, int((w_pick - 1) // 32) + 1))),
         })
 
-        base_pred = spnn.predict_custom_prospect(active_res["models"], active_res["feature_cols"], t_row.to_dict())
-        cust_pred = spnn.predict_custom_prospect(active_res["models"], active_res["feature_cols"], custom_dict)
+        base_pred = spnn.predict_custom_prospect(active_res, active_res["feature_cols"], t_row.to_dict())
+        cust_pred = spnn.predict_custom_prospect(active_res, active_res["feature_cols"], custom_dict)
 
-        st.markdown("#### 🚀 Live Neural Network Projection (Custom Prospect vs. Template Baseline)")
-        wc1, wc2, wc3, wc4, wc5, wc6 = st.columns(6)
-        for col_ui, t_col, fmt in zip(
-            [wc1, wc2, wc3, wc4, wc5, wc6],
-            spnn.TARGET_COLUMNS,
-            ["{:.1f} yd/g", "{:.2f} td/g", "{:.1f} yds", "{:.2f} TDs", "{:.2f} plays", "{:.3f} WPA"],
-        ):
-            c_m = cust_pred[t_col]["mean"]
-            b_m = base_pred[t_col]["mean"]
-            diff_m = c_m - b_m
-            col_ui.metric(
-                spnn.TARGET_LABELS[t_col],
-                fmt.format(c_m),
-                delta=f"{diff_m:+.2f} vs template",
-            )
+        st.markdown("#### 🚀 Multi-Model Consensus Projection (Custom Prospect vs. Template Baseline)")
+        whatif_rows = []
+        for t_col in spnn.TARGET_COLUMNS:
+            c_info = cust_pred[t_col]
+            b_info = base_pred[t_col]
+            whatif_rows.append({
+                "Target Dimension": spnn.TARGET_LABELS[t_col],
+                "Hybrid Ensemble": round(c_info["hybrid"], 2),
+                "Δ vs Template": round(c_info["hybrid"] - b_info["hybrid"], 2),
+                "Dual-Branch NN": round(c_info["nn"], 2),
+                "Bayesian Hierarchical": round(c_info["bayesian"], 2),
+                "Bayesian 10th-Pct Floor": round(c_info["floor_10"], 2),
+                "Bayesian 90th-Pct Ceiling": round(c_info["ceil_90"], 2),
+                "XGBoost / GBDT": round(c_info["xgb"], 2),
+            })
+        st.dataframe(pd.DataFrame(whatif_rows), width="stretch", height=430)
 
     # =========================================================
-    # SUB-TAB 4: NN ARCHITECTURE & COMBINE SIGNAL PROOF
+    # SUB-TAB 5: MULTI-MODEL BENCHMARK & SIGNAL PROOF
     # =========================================================
-    with sub_tab4:
-        st.subheader("🔬 5-Fold Cross-Validated Out-of-Sample Signal Across Feature Tiers")
+    with sub_tab5:
+        st.subheader(f"🔬 Head-to-Head 5-Fold Cross-Validation Benchmark (`{selected_tier}`)")
         st.markdown(
-            "Comparison of out-of-sample 5-fold cross-validation performance across all **150 skill-position players**:"
+            "Out-of-sample 5-Fold Cross-Validation accuracy comparing **Hybrid Stack Ensemble**, "
+            "**Dual-Branch Multi-Task Neural Network**, **Bayesian Hierarchical Model**, and **XGBoost / GBDT** "
+            "across all 11 Box-Score, 4th-Quarter Clutch, and Team-Impact targets:"
         )
-        all_tier_rows = []
-        for t_name, t_res in tier_results.items():
-            mdf = t_res["metrics_df"].copy()
-            mdf.insert(0, "Feature Tier", t_name)
-            all_tier_rows.append(mdf)
-        comp_df = pd.concat(all_tier_rows, ignore_index=True)
-        comp_df["r"] = comp_df["r"].round(3)
-        comp_df["p_val"] = comp_df["p_val"].round(4)
-        comp_df["spearman_rho"] = comp_df["spearman_rho"].round(3)
-        comp_df["mae"] = comp_df["mae"].round(3)
-        st.dataframe(
-            comp_df[["Feature Tier", "target_label", "r", "p_val", "spearman_rho", "mae"]],
-            width="stretch",
+
+        bench_df = active_res["benchmark_df"].copy()
+        fig_bm = px.bar(
+            bench_df,
+            x="target_label",
+            y="r",
+            color="model_family",
+            barmode="group",
+            title=f"5-Fold Out-of-Sample Correlation (Pearson r) by Model Family — {selected_tier}",
+            labels={"target_label": "Target Dimension", "r": "Out-of-Sample Pearson r", "model_family": "Model Architecture"},
         )
+        fig_bm.update_layout(height=440, xaxis_tickangle=-25)
+        st.plotly_chart(fig_bm, use_container_width=True)
+
+        pivot_r = bench_df.pivot(index="target_label", columns="model_family", values="r").reindex(
+            [spnn.TARGET_LABELS[c] for c in spnn.TARGET_COLUMNS]
+        )
+        st.markdown("**Out-of-Sample Pearson `r` Matrix Across Model Families:**")
+        st.dataframe(pivot_r.round(3), width="stretch")
 
         st.markdown("---")
         st.subheader(f"📈 Top Combine & Movement Drivers in `{selected_tier}`")
         imp_target = st.selectbox(
-            "Inspect Neural Network Feature Sensitivity For:",
+            "Inspect Standardized Feature Sensitivity For:",
             spnn.TARGET_COLUMNS,
             format_func=lambda c: spnn.TARGET_LABELS[c],
             key="imp_target",
@@ -949,4 +1213,5 @@ elif nav_choice == "🧠 Skill Position Neural Net & Clutch Projector":
         )
         fig_imp.update_layout(height=500)
         st.plotly_chart(fig_imp, use_container_width=True)
+
 
