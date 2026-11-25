@@ -107,12 +107,11 @@ def build_skill_position_dataset(con=None):
         con = duckdb.connect(DB_PATH, read_only=True)
         close_con = True
 
-    # 1. Base skill-position players + combine_results
+    # 1. Base skill-position players + combine_results (strictly End-of-Combine information)
     players_df = con.execute("""
         SELECT 
             p.nfl_id, p.display_name, p.nfl_position, p.draft_year,
             p.college_name, p.college_conference,
-            p.draft_round, p.draft_overall_pick,
             c.combine_height, c.combine_weight, c.hand_size, c.arm_length, c.wing_span,
             c.ten_yd_split, c.forty, c.vertical, c.broad_jump, c.three_cone, c.short_shuttle, c.bench_reps,
             c.ngs_athleticism_score, c.ngs_college_production_score, c.ngs_final_score
@@ -644,15 +643,9 @@ NGS_PRE_DRAFT_FEATURES = [
     "ngs_final_score",
 ]
 
-DRAFT_CAPITAL_FEATURES = [
-    "draft_overall_pick",
-    "draft_round",
-]
-
 FEATURE_TIERS = {
     "Tier 1: Pure Combine Physical + Movement Tracking": PHYSICAL_FEATURES + MOVEMENT_FEATURES,
-    "Tier 2: Combine + Movement + NGS Pre-Draft Scores": PHYSICAL_FEATURES + MOVEMENT_FEATURES + NGS_PRE_DRAFT_FEATURES,
-    "Tier 3: Combine + Movement + NGS + Draft Capital": PHYSICAL_FEATURES + MOVEMENT_FEATURES + NGS_PRE_DRAFT_FEATURES + DRAFT_CAPITAL_FEATURES,
+    "Tier 2: Full End-of-Combine Package (Physical + Movement + Combine NGS Scores)": PHYSICAL_FEATURES + MOVEMENT_FEATURES + NGS_PRE_DRAFT_FEATURES,
 }
 
 BOX_CLUTCH_TARGETS = [
@@ -1275,11 +1268,7 @@ def compute_feature_importances(models, X_df, feat_cols):
         cat = (
             "Movement Tracking"
             if col in MOVEMENT_FEATURES
-            else (
-                "NGS Pre-Draft Score"
-                if col in NGS_PRE_DRAFT_FEATURES
-                else ("Draft Capital" if col in DRAFT_CAPITAL_FEATURES else "Combine Physical")
-            )
+            else ("NGS Combine Score" if col in NGS_PRE_DRAFT_FEATURES else "Combine Physical")
         )
         row = {"feature": col, "category": cat}
         for t_i, t_col in enumerate(TARGET_COLUMNS):
@@ -1472,9 +1461,9 @@ if __name__ == "__main__":
     print(f"Loaded {len(df)} skill-position players and {len(player_games_df)} player-games.")
 
     tier_results = train_and_evaluate_tiers(df, k=5, seed=42)
-    t2 = tier_results["Tier 2: Combine + Movement + NGS Pre-Draft Scores"]
+    t2 = tier_results["Tier 2: Full End-of-Combine Package (Physical + Movement + Combine NGS Scores)"]
     print("\n" + "=" * 95)
-    print("5-FOLD CV BENCHMARK (Tier 2: Combine + Movement + NGS Pre-Draft Scores — Hybrid Stack Ensemble)")
+    print("5-FOLD CV BENCHMARK (Tier 2: Full End-of-Combine Package — Hybrid Stack Ensemble)")
     print("=" * 95)
     m_df = t2["metrics_df"].copy()
     m_df["r"] = m_df["r"].round(3)

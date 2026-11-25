@@ -422,10 +422,10 @@ elif nav_choice == "🧠 Skill Position Neural Net & Clutch Projector":
     with top_c2:
         tier_names = list(spnn.FEATURE_TIERS.keys())
         selected_tier = st.selectbox(
-            "🎚️ Select Pre-Draft Feature Tier:",
+            "🎚️ Select End-of-Combine Feature Tier:",
             tier_names,
             index=1,
-            help="Compare Pure Physical + Movement Tracking (Tier 1) against adding NGS Pre-Draft Scores (Tier 2) or Draft Capital (Tier 3).",
+            help="All models strictly use information available at the conclusion of the NFL Combine (no draft round or draft pick used).",
         )
 
     active_res = tier_results[selected_tier]
@@ -508,11 +508,6 @@ elif nav_choice == "🧠 Skill Position Neural Net & Clutch Projector":
         sel_id = id_map[selected_opt]
         p_row = view_df[view_df["nfl_id"] == sel_id].iloc[0]
 
-        draft_str = (
-            f"Round {int(p_row['draft_round'])}, Pick #{int(p_row['draft_overall_pick'])}"
-            if pd.notna(p_row["draft_overall_pick"])
-            else "Undrafted / PFA"
-        )
         forty_str = f"{p_row['forty']:.2f}s" if pd.notna(p_row["forty"]) else "Skipped"
         go_a_str = f"{p_row['drill_go_route_max_a']:.2f} yd/s²" if pd.notna(p_row["drill_go_route_max_a"]) else "N/A"
         tr40_a_str = f"{p_row['tr40_p90_a']:.2f} yd/s²" if pd.notna(p_row["tr40_p90_a"]) else "N/A"
@@ -525,7 +520,7 @@ elif nav_choice == "🧠 Skill Position Neural Net & Clutch Projector":
         st.info(
             f"**{p_row['display_name']}** (`nfl_id={int(sel_id)}`) &nbsp;|&nbsp; "
             f"**Pos:** `{p_row['nfl_position']}` &nbsp;|&nbsp; **College:** `{p_row['college_name']}` &nbsp;|&nbsp; "
-            f"**Draft ({int(p_row['draft_year'])}):** `{draft_str}` &nbsp;|&nbsp; "
+            f"**Combine Year:** `{int(p_row['draft_year'])}` &nbsp;|&nbsp; "
             f"**40-Yd:** `{forty_str}` &nbsp;|&nbsp; **40-Yd P90 Accel:** `{tr40_a_str}` &nbsp;|&nbsp; "
             f"**Go-Route Peak Accel:** `{go_a_str}` &nbsp;|&nbsp; **Slant Speed:** `{slant_s_str}` &nbsp;|&nbsp; "
             f"**Clutch Score:** `{p_row['clutch_percentile']:.1f}th pct` &nbsp;|&nbsp; "
@@ -983,7 +978,6 @@ elif nav_choice == "🧠 Skill Position Neural Net & Clutch Projector":
             hover_data=[
                 "draft_year",
                 "college_name",
-                "draft_overall_pick",
                 f"floor10_{target_plot_col}",
                 f"ceil90_{target_plot_col}",
                 "clutch_percentile",
@@ -1017,7 +1011,6 @@ elif nav_choice == "🧠 Skill Position Neural Net & Clutch Projector":
             "nfl_position",
             "draft_year",
             "college_name",
-            "draft_overall_pick",
             "clutch_percentile",
             "team_impact_percentile",
             f"pred_{target_plot_col}",
@@ -1097,13 +1090,13 @@ elif nav_choice == "🧠 Skill Position Neural Net & Clutch Projector":
             w_centrip = st.slider("Route Centripetal Cut Accel (yd/s²):", 5.0, 22.0, _val("trroute_max_centrip", 12.5), 0.25)
 
         with w_c3:
-            st.markdown("#### 🎓 Pre-Draft & Draft Context")
+            st.markdown("#### 📊 Explosiveness & Combine NGS Scores")
             w_vert = st.slider("Vertical Jump (inches):", 28.0, 44.0, _val("vertical", 36.0), 0.5)
             w_broad = st.slider("Broad Jump (inches):", 108.0, 140.0, _val("broad_jump", 123.0), 1.0)
-            w_ngs_prod = st.slider("NGS College Production Score:", 50.0, 99.0, _val("ngs_college_production_score", 76.0), 1.0)
-            w_ngs_ath = st.slider("NGS Athleticism Score:", 50.0, 99.0, _val("ngs_athleticism_score", 78.0), 1.0)
-            w_ngs_fin = st.slider("NGS Final Pre-Draft Score:", 50.0, 99.0, _val("ngs_final_score", 77.0), 1.0)
-            w_pick = st.slider("Draft Overall Pick #:", 1.0, 260.0, _val("draft_overall_pick", 65.0), 1.0)
+            w_ten = st.slider("10-Yard Split (s):", 1.44, 1.75, _val("ten_yd_split", 1.54), 0.01)
+            w_ngs_prod = st.slider("NGS Combine College Production Score:", 50.0, 99.0, _val("ngs_college_production_score", 76.0), 1.0)
+            w_ngs_ath = st.slider("NGS Combine Athleticism Score:", 50.0, 99.0, _val("ngs_athleticism_score", 78.0), 1.0)
+            w_ngs_fin = st.slider("NGS Combine Final Score:", 50.0, 99.0, _val("ngs_final_score", 77.0), 1.0)
 
         custom_dict = t_row.to_dict()
         custom_dict.update({
@@ -1116,6 +1109,7 @@ elif nav_choice == "🧠 Skill Position Neural Net & Clutch Projector":
             "arm_length": w_arm,
             "wing_span": w_wing,
             "catch_radius": w_arm + w_wing + w_hand,
+            "ten_yd_split": w_ten,
             "forty": w_forty,
             "speed_score": (w_weight * 200.0) / (w_forty ** 4),
             "three_cone": w_3cone,
@@ -1136,8 +1130,6 @@ elif nav_choice == "🧠 Skill Position Neural Net & Clutch Projector":
             "ngs_college_production_score": w_ngs_prod,
             "ngs_athleticism_score": w_ngs_ath,
             "ngs_final_score": w_ngs_fin,
-            "draft_overall_pick": w_pick,
-            "draft_round": float(min(7, max(1, int((w_pick - 1) // 32) + 1))),
         })
 
         base_pred = spnn.predict_custom_prospect(active_res, active_res["feature_cols"], t_row.to_dict())
