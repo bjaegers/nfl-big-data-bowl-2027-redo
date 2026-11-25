@@ -852,6 +852,16 @@ class DualBranchCombineNN:
 
         return self
 
+    def encode_latent(self, X):
+        Xs = self._preprocess_transform(X)
+        Xp = Xs[:, self.phys_idx]
+        Xm = Xs[:, self.move_idx]
+        ap, _ = self._silu(Xp @ self.params["Wp"] + self.params["bp"])
+        am, _ = self._silu(Xm @ self.params["Wm"] + self.params["bm"])
+        concat_pm = np.concatenate([ap, am], axis=1)
+        aj, _ = self._silu(concat_pm @ self.params["Wj"] + self.params["bj"])
+        return aj
+
     def predict(self, X):
         Xs = self._preprocess_transform(X)
         Xp = Xs[:, self.phys_idx]
@@ -1277,6 +1287,144 @@ def compute_feature_importances(models, X_df, feat_cols):
         rows.append(row)
 
     return pd.DataFrame(rows)
+
+
+def find_nearest_neighbor_comps(df_players, tier_res, slider_feature_dict, position="WR", top_k=5, lambda_miss=0.95):
+    """
+    Hybrid Nearest-Neighbor Comp & KNN Imputation Engine:
+      1. Filters/weights candidates by position group and standardizes all queried slider metrics.
+      2. Computes Importance-Weighted, Missingness-Penalized Z-Distance separately for:
+         - Physical & Stopwatch traits (`d_phys`)
+         - Combine Movement Tracking kinematics (`d_move`)
+         - Combined Trait Distance (`d_trait`)
+      3. Imputes any un-slid background sub-drill features for the Custom Prospect via
+         similarity-kernel-weighted average of the top neighbors.
+      4. Computes Neural Latent Embedding Similarity (`d_latent`) in the 24-D joint hidden layer
+         of the 5-Fold DualBranchCombineNN ensemble ("Functional On-Field Role Comp").
+      5. Blends Trait Similarity (70%) + Neural Latent Similarity (30%) into a 0-100% Comp Score.
+    """
+    feat_cols = tier_res["feature_cols"]
+    imp_df = tier_res["importances_df"]
+    nn_models = tier_res["nn_models"]
+
+    # Build importance weight lookup per feature (mean standardized effect across targets + base floor)
+    eff_cols = [c for c in imp_df.columns if c.startswith("abs_effect_")]
+    imp_weights = {}
+    if len(eff_cols) > 0:
+        raw_imp = imp_df[eff_cols].mean(axis=1).values
+        max_imp = max(1e-6, float(np.max(raw_imp)))
+        for f_name, val in zip(imp_df["feature"].values, raw_imp):
+            imp_weights[f_name] = 0.5 + 1.5 * float(val / max_imp)
+
+    # Candidate pool (prefer matching position; if RB has only 2 players, include all skill players with a position penalty)
+    pos_mask = df_players["nfl_position"] == position
+    if int(pos_mask.sum()) >= top_k:
+        cand_df = df_players[pos_mask].copy().reset_index(drop=True)
+        pos_penalty = np.zeros(len(cand_df))
+    else:
+        cand_df = df_players.copy().reset_index(drop=True)
+        pos_penalty = np.where(cand_df["nfl_position"] == position, 0.0, 0.85)
+
+    # Active queried features (excluding binary position indicators)
+    queried_cols = [
+        c for c in slider_feature_dict.keys()
+        if c in cand_df.columns and c not in ("is_wr", "is_te") and pd.notna(slider_feature_dict[c])
+    ]
+    phys_q_cols = [c for c in queried_cols if c not in MOVEMENT_FEATURES]
+    move_q_cols = [c for c in queried_cols if c in MOVEMENT_FEATURES]
+
+    def _compute_group_dist(cols_subset):
+        if len(cols_subset) == 0:
+            return np.zeros(len(cand_df))
+        n_c = len(cand_df)
+        weighted_sq_sum = np.zeros(n_c)
+        total_w = 0.0
+        for c in cols_subset:
+            w_c = float(imp_weights.get(c, 1.0))
+            col_vals = cand_df[c].to_numpy(dtype=float, na_value=np.nan)
+            fin = col_vals[np.isfinite(col_vals)]
+            if len(fin) < 3:
+                continue
+            mu = float(np.mean(fin))
+            sd = float(np.std(fin))
+            if sd < 1e-6:
+                continue
+            z_cust = np.clip((float(slider_feature_dict[c]) - mu) / sd, -3.5, 3.5)
+            z_cand = np.clip((col_vals - mu) / sd, -3.5, 3.5)
+            sq_diff = np.where(np.isfinite(z_cand), (z_cust - z_cand) ** 2, lambda_miss)
+            weighted_sq_sum += w_c * sq_diff
+            total_w += w_c
+        if total_w <= 0:
+            return np.zeros(n_c)
+        return np.sqrt(weighted_sq_sum / total_w)
+
+    d_phys = _compute_group_dist(phys_q_cols) + pos_penalty
+    d_move = _compute_group_dist(move_q_cols) + pos_penalty
+    d_trait = _compute_group_dist(queried_cols) + pos_penalty
+
+    # Initial kernel weights from d_trait to impute un-slid background features via Top-8 KNN
+    init_order = np.argsort(d_trait)[: min(8, len(cand_df))]
+    init_w = np.exp(-0.8 * (d_trait[init_order] ** 2))
+    init_w = init_w / np.maximum(1e-8, np.sum(init_w))
+
+    full_custom_dict = {}
+    for c in feat_cols:
+        if c in slider_feature_dict and pd.notna(slider_feature_dict[c]):
+            full_custom_dict[c] = float(slider_feature_dict[c])
+        elif c in cand_df.columns:
+            vals = cand_df.iloc[init_order][c].to_numpy(dtype=float, na_value=np.nan)
+            fin_m = np.isfinite(vals)
+            if np.any(fin_m):
+                w_sub = init_w[fin_m]
+                full_custom_dict[c] = float(np.sum(vals[fin_m] * w_sub) / np.sum(w_sub))
+            else:
+                all_fin = df_players[c].dropna()
+                full_custom_dict[c] = float(all_fin.median()) if len(all_fin) > 0 else 0.0
+        else:
+            full_custom_dict[c] = 0.0
+
+    # Compute Multi-Task Functional Role Embedding Distance across the 11-D predicted impact space
+    X_cand = cand_df[feat_cols].to_numpy(dtype=float, na_value=np.nan)
+    x_cust = np.array([[full_custom_dict[c] for c in feat_cols]], dtype=float)
+
+    cand_role_preds = np.mean([m.predict(X_cand) for m in nn_models], axis=0)  # (N_cand, 11)
+    cust_role_pred = np.mean([m.predict(x_cust)[0] for m in nn_models], axis=0)  # (11,)
+    role_sd = np.maximum(1e-6, np.std(cand_role_preds, axis=0))
+    role_z_diff = np.clip((cand_role_preds - cust_role_pred[None, :]) / role_sd[None, :], -3.5, 3.5)
+    d_latent = np.sqrt(np.mean(role_z_diff ** 2, axis=1)) + pos_penalty
+
+    # Hybrid Distance: 70% Importance-Weighted Trait Distance + 30% Neural Latent Role Distance
+    d_hybrid = 0.70 * d_trait + 0.30 * d_latent
+
+    # Convert distances into intuitive 0-100% Scouting Similarity Scores
+    cand_df["similarity_pct"] = (100.0 * np.exp(-0.38 * (d_hybrid ** 2))).round(1)
+    cand_df["physical_sim_pct"] = (100.0 * np.exp(-0.38 * (d_phys ** 2))).round(1)
+    cand_df["movement_sim_pct"] = (100.0 * np.exp(-0.38 * (d_move ** 2))).round(1)
+    cand_df["neural_role_sim_pct"] = (100.0 * np.exp(-0.38 * (d_latent ** 2))).round(1)
+    cand_df["hybrid_distance"] = d_hybrid.round(3)
+
+    comps_df = cand_df.sort_values("hybrid_distance", ascending=True).head(top_k).reset_index(drop=True)
+
+    # Compute similarity-weighted KNN Consensus Baseline across the Top-K Comps
+    comp_w = np.exp(-0.6 * (comps_df["hybrid_distance"].to_numpy(dtype=float) ** 2))
+    comp_w = comp_w / np.maximum(1e-8, np.sum(comp_w))
+
+    comp_1_row = comps_df.iloc[0]
+    comp_1_pred = predict_custom_prospect(tier_res, feat_cols, comp_1_row.to_dict())
+
+    knn_consensus_pred = {}
+    for t_col in TARGET_COLUMNS:
+        actual_vals = comps_df[t_col].to_numpy(dtype=float)
+        knn_actual_avg = float(np.sum(actual_vals * comp_w))
+        knn_consensus_pred[t_col] = {
+            "comp1_name": str(comp_1_row["display_name"]),
+            "comp1_sim_pct": float(comp_1_row["similarity_pct"]),
+            "comp1_model_hybrid": float(comp_1_pred[t_col]["hybrid"]),
+            "comp1_actual": float(comp_1_row[t_col]),
+            "top_k_actual_weighted": knn_actual_avg,
+        }
+
+    return full_custom_dict, comps_df, knn_consensus_pred
 
 
 def predict_custom_prospect(tier_res_Or_models, feat_cols, custom_feature_dict):

@@ -80,7 +80,7 @@ nav_choice = st.sidebar.radio(
 )
 
 @st.cache_resource
-def load_skill_nn_bundle(schema_version: str = "v3_end_of_combine_only"):
+def load_skill_nn_bundle(schema_version: str = "v4_knn_comps"):
     df_players, df_games, df_tracking = spnn.build_skill_position_dataset(con)
     tier_results = spnn.train_and_evaluate_tiers(df_players, k=5, seed=42)
     return df_players, df_games, df_tracking, tier_results
@@ -405,7 +405,7 @@ elif nav_choice == "🧠 Skill Position Neural Net & Clutch Projector":
     )
 
     with st.spinner("Training 5-Fold Ensembles (Dual-Branch NN + Bayesian Hierarchical + XGBoost/GBDT)..."):
-        df_players, df_games, df_tracking, tier_results = load_skill_nn_bundle("v3_end_of_combine_only")
+        df_players, df_games, df_tracking, tier_results = load_skill_nn_bundle("v4_knn_comps")
 
     top_c1, top_c2 = st.columns([1.15, 1])
     with top_c1:
@@ -1048,58 +1048,57 @@ elif nav_choice == "🧠 Skill Position Neural Net & Clutch Projector":
         )
 
     # =========================================================
-    # SUB-TAB 4: CUSTOM PROSPECT "WHAT-IF" LAB (ALL 4 MODELS)
+    # SUB-TAB 4: CUSTOM PROSPECT "WHAT-IF" LAB (NEAREST-NEIGHBOR COMPS + ALL 4 MODELS)
     # =========================================================
     with sub_tab4:
-        st.subheader("🧪 Custom Prospect 'What-If' Combine & Movement Simulator (All 4 Model Families)")
+        st.subheader("🧪 Custom Prospect 'What-If' Lab & Nearest-Neighbor NFL Comp Engine")
         st.markdown(
-            "Load any player's Combine profile as a template, then adjust **Combine Physical Measurables** or "
-            "**Combine Drill Tracking Kinematics** to see live forward-pass predictions across **all 4 model families** "
-            "(**Hybrid Ensemble**, **Dual-Branch NN**, **Bayesian Hierarchical + 80% Credible Interval**, and **XGBoost/GBDT**)."
+            "Adjust the **Combine Physical** and **Drill Movement Tracking** sliders below to define a prospect. "
+            "The engine automatically computes **Importance-Weighted, Missingness-Penalized Z-Distances + Neural Latent Role Similarity** "
+            "to find the **Top 5 Nearest-Neighbor NFL Combine Comps**, imputes any secondary sub-drill metrics via KNN kernel regression, "
+            "and runs the prospect through **all 4 model families**."
         )
 
-        template_opt = st.selectbox("Load Template Player Profile:", player_options, key="whatif_template")
-        t_row = view_df[view_df["nfl_id"] == id_map[template_opt]].iloc[0]
+        w_pos = st.radio("Select Prospect Position Group:", ["WR", "TE", "RB"], horizontal=True)
+        pos_sub_df = view_df[view_df["nfl_position"] == w_pos] if (view_df["nfl_position"] == w_pos).sum() >= 3 else view_df
 
-        def _val(col, fallback):
-            v = t_row.get(col, np.nan)
-            return float(v) if pd.notna(v) else float(fallback)
+        def _med(col, fallback):
+            s = pos_sub_df[col].dropna()
+            return float(s.median()) if len(s) > 0 else float(fallback)
 
         w_c1, w_c2, w_c3 = st.columns(3)
         with w_c1:
             st.markdown("#### 📏 Physical & Stopwatch")
-            w_pos = st.selectbox("Position:", ["WR", "TE", "RB"], index=0 if t_row["nfl_position"] == "WR" else 1)
-            w_height = st.slider("Height (inches):", 67.0, 80.0, _val("combine_height", 73.0), 0.25)
-            w_weight = st.slider("Weight (lbs):", 165.0, 270.0, _val("combine_weight", 205.0), 1.0)
-            w_hand = st.slider("Hand Size (inches — Q4 Step-Up Trait):", 8.25, 11.0, _val("hand_size", 9.5), 0.125)
-            w_arm = st.slider("Arm Length (inches):", 29.0, 35.5, _val("arm_length", 32.0), 0.25)
-            w_wing = st.slider("Wingspan (inches):", 70.0, 85.0, _val("wing_span", 77.0), 0.25)
-            w_forty = st.slider("40-Yard Dash (s):", 4.21, 4.95, _val("forty", 4.46), 0.01)
-            w_3cone = st.slider("3-Cone Drill (s — Money-Down Trait):", 6.40, 7.60, _val("three_cone", 6.95), 0.01)
-            w_shuttle = st.slider("Short Shuttle (s):", 3.90, 4.65, _val("short_shuttle", 4.25), 0.01)
+            w_height = st.slider("Height (inches):", 67.0, 80.0, round(_med("combine_height", 73.0) * 4) / 4, 0.25)
+            w_weight = st.slider("Weight (lbs):", 165.0, 270.0, round(_med("combine_weight", 205.0)), 1.0)
+            w_hand = st.slider("Hand Size (inches — Q4 Step-Up Trait):", 8.25, 11.0, round(_med("hand_size", 9.5) * 8) / 8, 0.125)
+            w_arm = st.slider("Arm Length (inches):", 29.0, 35.5, round(_med("arm_length", 32.0) * 4) / 4, 0.25)
+            w_wing = st.slider("Wingspan (inches):", 70.0, 85.0, round(_med("wing_span", 77.0) * 4) / 4, 0.25)
+            w_forty = st.slider("40-Yard Dash (s):", 4.21, 4.95, round(_med("forty", 4.46), 2), 0.01)
+            w_3cone = st.slider("3-Cone Drill (s — Money-Down Trait):", 6.40, 7.60, round(_med("three_cone", 6.95), 2), 0.01)
+            w_shuttle = st.slider("Short Shuttle (s):", 3.90, 4.65, round(_med("short_shuttle", 4.25), 2), 0.01)
 
         with w_c2:
             st.markdown("#### 📡 Combine Movement Tracking")
-            w_go_a = st.slider("Go-Route Peak Accel (yd/s² — #1 Q4 TD Trait):", 3.5, 9.5, _val("drill_go_route_max_a", 6.2), 0.1)
-            w_tr40_p90_a = st.slider("40-Yd Tracking P90 Accel (yd/s²):", 2.5, 6.5, _val("tr40_p90_a", 4.4), 0.05)
-            w_tr40_tang_a = st.slider("40-Yd Peak Tangential Accel (yd/s²):", 3.5, 9.5, _val("tr40_max_tang_a", 6.3), 0.1)
-            w_tr40_mean_s = st.slider("40-Yd Tracking Mean Speed (yd/s):", 4.5, 8.2, _val("tr40_mean_s", 6.4), 0.05)
-            w_gauntlet_a = st.slider("Gauntlet Drill Peak Accel (yd/s²):", 3.0, 9.0, _val("drill_gauntlet_max_a", 5.5), 0.1)
-            w_slant_s = st.slider("Slant Route Peak Speed (yd/s — Q4 & Gravity):", 5.5, 9.8, _val("drill_slant_ro_max_s", 7.8), 0.05)
-            w_route_max_s = st.slider("All-Route Peak Speed (yd/s):", 6.5, 10.8, _val("trroute_max_s", 8.8), 0.05)
-            w_centrip = st.slider("Route Centripetal Cut Accel (yd/s²):", 5.0, 22.0, _val("trroute_max_centrip", 12.5), 0.25)
+            w_go_a = st.slider("Go-Route Peak Accel (yd/s² — #1 Q4 TD Trait):", 3.5, 9.5, round(_med("drill_go_route_max_a", 6.2), 1), 0.1)
+            w_tr40_p90_a = st.slider("40-Yd Tracking P90 Accel (yd/s²):", 2.5, 6.5, round(_med("tr40_p90_a", 4.4), 2), 0.05)
+            w_tr40_tang_a = st.slider("40-Yd Peak Tangential Accel (yd/s²):", 3.5, 9.5, round(_med("tr40_max_tang_a", 6.3), 1), 0.1)
+            w_tr40_mean_s = st.slider("40-Yd Tracking Mean Speed (yd/s):", 4.5, 8.2, round(_med("tr40_mean_s", 6.4), 2), 0.05)
+            w_gauntlet_a = st.slider("Gauntlet Drill Peak Accel (yd/s²):", 3.0, 9.0, round(_med("drill_gauntlet_max_a", 5.5), 1), 0.1)
+            w_slant_s = st.slider("Slant Route Peak Speed (yd/s — Q4 & Gravity):", 5.5, 9.8, round(_med("drill_slant_ro_max_s", 7.8), 2), 0.05)
+            w_route_max_s = st.slider("All-Route Peak Speed (yd/s):", 6.5, 10.8, round(_med("trroute_max_s", 8.8), 2), 0.05)
+            w_centrip = st.slider("Route Centripetal Cut Accel (yd/s²):", 5.0, 22.0, round(_med("trroute_max_centrip", 12.5) * 4) / 4, 0.25)
 
         with w_c3:
             st.markdown("#### 📊 Explosiveness & Combine NGS Scores")
-            w_vert = st.slider("Vertical Jump (inches):", 28.0, 44.0, _val("vertical", 36.0), 0.5)
-            w_broad = st.slider("Broad Jump (inches):", 108.0, 140.0, _val("broad_jump", 123.0), 1.0)
-            w_ten = st.slider("10-Yard Split (s):", 1.44, 1.75, _val("ten_yd_split", 1.54), 0.01)
-            w_ngs_prod = st.slider("NGS Combine College Production Score:", 50.0, 99.0, _val("ngs_college_production_score", 76.0), 1.0)
-            w_ngs_ath = st.slider("NGS Combine Athleticism Score:", 50.0, 99.0, _val("ngs_athleticism_score", 78.0), 1.0)
-            w_ngs_fin = st.slider("NGS Combine Final Score:", 50.0, 99.0, _val("ngs_final_score", 77.0), 1.0)
+            w_vert = st.slider("Vertical Jump (inches):", 28.0, 44.0, round(_med("vertical", 36.0) * 2) / 2, 0.5)
+            w_broad = st.slider("Broad Jump (inches):", 108.0, 140.0, round(_med("broad_jump", 123.0)), 1.0)
+            w_ten = st.slider("10-Yard Split (s):", 1.44, 1.75, round(_med("ten_yd_split", 1.54), 2), 0.01)
+            w_ngs_prod = st.slider("NGS Combine College Production Score:", 50.0, 99.0, round(_med("ngs_college_production_score", 76.0)), 1.0)
+            w_ngs_ath = st.slider("NGS Combine Athleticism Score:", 50.0, 99.0, round(_med("ngs_athleticism_score", 78.0)), 1.0)
+            w_ngs_fin = st.slider("NGS Combine Final Score:", 50.0, 99.0, round(_med("ngs_final_score", 77.0)), 1.0)
 
-        custom_dict = t_row.to_dict()
-        custom_dict.update({
+        slider_query_dict = {
             "is_wr": 1.0 if w_pos == "WR" else 0.0,
             "is_te": 1.0 if w_pos == "TE" else 0.0,
             "combine_height": w_height,
@@ -1126,28 +1125,109 @@ elif nav_choice == "🧠 Skill Position Neural Net & Clutch Projector":
             "drill_slant_ro_max_s": w_slant_s,
             "trroute_max_s": w_route_max_s,
             "trroute_max_centrip": w_centrip,
-            "route_to_40_speed_ratio": w_route_max_s / max(7.0, _val("tr40_max_s", 9.8)),
+            "route_to_40_speed_ratio": w_route_max_s / max(7.0, _med("tr40_max_s", 9.8)),
             "ngs_college_production_score": w_ngs_prod,
             "ngs_athleticism_score": w_ngs_ath,
             "ngs_final_score": w_ngs_fin,
-        })
+        }
 
-        base_pred = spnn.predict_custom_prospect(active_res, active_res["feature_cols"], t_row.to_dict())
-        cust_pred = spnn.predict_custom_prospect(active_res, active_res["feature_cols"], custom_dict)
+        full_custom_dict, comps_df, knn_consensus = spnn.find_nearest_neighbor_comps(
+            view_df, active_res, slider_query_dict, position=w_pos, top_k=5
+        )
+        cust_pred = spnn.predict_custom_prospect(active_res, active_res["feature_cols"], full_custom_dict)
 
-        st.markdown("#### 🚀 Multi-Model Consensus Projection (Custom Prospect vs. Template Baseline)")
+        top_comp = comps_df.iloc[0]
+        st.markdown("---")
+        st.markdown(
+            f"#### 🧬 Nearest-Neighbor NFL Combine Comps "
+            f"(Closest Match: **{top_comp['display_name']}** — `{top_comp['similarity_pct']:.1f}%` Overall Similarity)"
+        )
+        st.caption(
+            "Computed via **70% Importance-Weighted, Missingness-Penalized Z-Distance** + **30% Dual-Branch Neural Latent Role Similarity**."
+        )
+
+        comp_c1, comp_c2 = st.columns([1.35, 1])
+        with comp_c1:
+            comp_display_cols = [
+                "display_name",
+                "nfl_position",
+                "draft_year",
+                "college_name",
+                "similarity_pct",
+                "physical_sim_pct",
+                "movement_sim_pct",
+                "neural_role_sim_pct",
+                "yards_per_game",
+                "tds_per_game",
+                "q4_explosive_per_game",
+                "first_downs_per_100_routes",
+                "third_fourth_conv_per_season",
+                "team_impact_percentile",
+            ]
+            comp_table = comps_df[comp_display_cols].rename(
+                columns={
+                    "display_name": "NFL Comp",
+                    "nfl_position": "Pos",
+                    "draft_year": "Year",
+                    "college_name": "College",
+                    "similarity_pct": "Overall Sim %",
+                    "physical_sim_pct": "Physical Sim %",
+                    "movement_sim_pct": "Movement Sim %",
+                    "neural_role_sim_pct": "Neural Role Sim %",
+                    "yards_per_game": "Actual Yds/G",
+                    "tds_per_game": "Actual TDs/G",
+                    "q4_explosive_per_game": "Actual Q4 Expl/Yr",
+                    "first_downs_per_100_routes": "Actual 1D/100 Rts",
+                    "third_fourth_conv_per_season": "Actual 3rd/4th Conv/Yr",
+                    "team_impact_percentile": "Team Impact Pct",
+                }
+            )
+            st.dataframe(comp_table.round(2), width="stretch", height=235)
+
+        with comp_c2:
+            sim_melt = comps_df.melt(
+                id_vars=["display_name"],
+                value_vars=["overall_sim" if "overall_sim" in comps_df else "similarity_pct", "physical_sim_pct", "movement_sim_pct", "neural_role_sim_pct"],
+                var_name="Similarity Dimension",
+                value_name="Similarity (%)",
+            )
+            sim_label_map = {
+                "similarity_pct": "Overall Hybrid Sim %",
+                "physical_sim_pct": "Physical & Stopwatch %",
+                "movement_sim_pct": "Movement Tracking %",
+                "neural_role_sim_pct": "Neural Role Embedding %",
+            }
+            sim_melt["Similarity Dimension"] = sim_melt["Similarity Dimension"].map(sim_label_map)
+            fig_comp = px.bar(
+                sim_melt,
+                x="Similarity (%)",
+                y="display_name",
+                color="Similarity Dimension",
+                barmode="group",
+                orientation="h",
+                title="Top 5 Nearest Neighbors — Multi-Space Similarity Breakdown",
+                labels={"display_name": "Nearest NFL Comp"},
+            )
+            fig_comp.update_layout(height=235, margin=dict(l=10, r=10, t=35, b=10), yaxis=dict(autorange="reversed"))
+            st.plotly_chart(fig_comp, use_container_width=True)
+
+        st.markdown(
+            f"#### 🚀 Multi-Model Consensus Projection vs. Nearest Neighbor (**{top_comp['display_name']}**) & Top-5 KNN Actuals"
+        )
         whatif_rows = []
         for t_col in spnn.TARGET_COLUMNS:
             c_info = cust_pred[t_col]
-            b_info = base_pred[t_col]
+            k_info = knn_consensus[t_col]
             whatif_rows.append({
                 "Target Dimension": spnn.TARGET_LABELS[t_col],
-                "Hybrid Ensemble": round(c_info["hybrid"], 2),
-                "Δ vs Template": round(c_info["hybrid"] - b_info["hybrid"], 2),
+                "Custom Prospect (Hybrid)": round(c_info["hybrid"], 2),
+                f"#1 Comp ({k_info['comp1_name']}) Model": round(k_info["comp1_model_hybrid"], 2),
+                f"Δ vs #1 Comp": round(c_info["hybrid"] - k_info["comp1_model_hybrid"], 2),
+                f"#1 Comp Actual NFL": round(k_info["comp1_actual"], 2),
+                "Top-5 Comps Actual Avg": round(k_info["top_k_actual_weighted"], 2),
                 "Dual-Branch NN": round(c_info["nn"], 2),
                 "Bayesian Hierarchical": round(c_info["bayesian"], 2),
-                "Bayesian 10th-Pct Floor": round(c_info["floor_10"], 2),
-                "Bayesian 90th-Pct Ceiling": round(c_info["ceil_90"], 2),
+                "Bayesian 80% CI": f"{c_info['floor_10']:.1f} – {c_info['ceil_90']:.1f}",
                 "XGBoost / GBDT": round(c_info["xgb"], 2),
             })
         st.dataframe(pd.DataFrame(whatif_rows), width="stretch", height=430)
