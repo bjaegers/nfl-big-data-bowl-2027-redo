@@ -80,7 +80,7 @@ nav_choice = st.sidebar.radio(
 )
 
 @st.cache_resource
-def load_skill_nn_bundle():
+def load_skill_nn_bundle(schema_version: str = "v3_end_of_combine_only"):
     df_players, df_games, df_tracking = spnn.build_skill_position_dataset(con)
     tier_results = spnn.train_and_evaluate_tiers(df_players, k=5, seed=42)
     return df_players, df_games, df_tracking, tier_results
@@ -405,7 +405,7 @@ elif nav_choice == "🧠 Skill Position Neural Net & Clutch Projector":
     )
 
     with st.spinner("Training 5-Fold Ensembles (Dual-Branch NN + Bayesian Hierarchical + XGBoost/GBDT)..."):
-        df_players, df_games, df_tracking, tier_results = load_skill_nn_bundle()
+        df_players, df_games, df_tracking, tier_results = load_skill_nn_bundle("v3_end_of_combine_only")
 
     top_c1, top_c2 = st.columns([1.15, 1])
     with top_c1:
